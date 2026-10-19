@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Check": {
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "additionalProperties": true,
+          "title": "Inputs",
+          "type": "object"
+        },
+        "expected": {
+          "title": "Expected"
+        },
+        "name": {
+          "default": "contract",
+          "title": "Name",
+          "type": "string"
+        },
+        "expected_path": {
+          "default": "",
+          "title": "Expected Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected"
+      ],
+      "title": "Check",
+      "type": "object"
+    },
+    "Dependency": {
+      "additionalProperties": false,
+      "properties": {
+        "tool_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$",
+          "title": "Tool Id",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^v[1-9][0-9]*$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_id",
+        "version"
+      ],
+      "title": "Dependency",
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "properties": {
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "memory_mb": {
+          "default": 256,
+          "maximum": 8192,
+          "minimum": 32,
+          "title": "Memory Mb",
+          "type": "integer"
+        },
+        "cpus": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "maximum": 8,
+          "title": "Cpus",
+          "type": "number"
+        },
+        "pids": {
+          "default": 64,
+          "maximum": 512,
+          "minimum": 8,
+          "title": "Pids",
+          "type": "integer"
+        },
+        "output_bytes": {
+          "default": 1048576,
+          "maximum": 16777216,
+          "minimum": 1024,
+          "title": "Output Bytes",
+          "type": "integer"
+        },
+        "artifact_bytes": {
+          "default": 8388608,
+          "maximum": 67108864,
+          "minimum": 1024,
+          "title": "Artifact Bytes",
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object"
+    },
+    "Manifest": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "version": {
+          "default": "v1",
+          "pattern": "^v[1-9][0-9]*$",
+          "title": "Version",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aliases",
+          "type": "array"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "kind": {
+          "default": "script",
+          "enum": [
+            "script",
+            "workflow",
+            "model_pipeline",
+            "adapter"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "scope": {
+          "default": "project",
+          "enum": [
+            "global",
+            "project",
+            "environment"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "project_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Key"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Environment"
+        },
+        "entrypoint": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Entrypoint",
+          "type": "array"
+        },
+        "input_schema": {
+          "additionalProperties": true,
+          "title": "Input Schema",
+          "type": "object"
+        },
+        "output_schema": {
+          "additionalProperties": true,
+          "title": "Output Schema",
+          "type": "object"
+        },
+        "permissions": {
+          "$ref": "#/$defs/Permissions"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Limits"
+        },
+        "dependencies": {
+          "items": {
+            "$ref": "#/$defs/Dependency"
+          },
+          "title": "Dependencies",
+          "type": "array"
+        },
+        "side_effect": {
+          "default": "pure",
+          "enum": [
+            "pure",
+            "read_only",
+            "workspace_write",
+            "external_write"
+          ],
+          "title": "Side Effect",
+          "type": "string"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/Check"
+          },
+          "title": "Checks",
+          "type": "array"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/Step"
+          },
+          "title": "Steps",
+          "type": "array"
+        },
+        "adapter": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adapter"
+        },
+        "freshness_seconds": {
+          "default": 0,
+          "maximum": 31536000,
+          "minimum": 0,
+          "title": "Freshness Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "description"
+      ],
+      "title": "Manifest",
+      "type": "object"
+    },
+    "Permissions": {
+      "additionalProperties": false,
+      "properties": {
+        "file_read": {
+          "items": {
+            "const": "workspace",
+            "type": "string"
+          },
+          "title": "File Read",
+          "type": "array"
+        },
+        "file_write": {
+          "default": [
+            "artifacts"
+          ],
+          "items": {
+            "enum": [
+              "artifacts",
+              "workspace"
+            ],
+            "type": "string"
+          },
+          "title": "File Write",
+          "type": "array"
+        },
+        "network": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Network",
+          "type": "array"
+        },
+        "secrets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secrets",
+          "type": "array"
+        }
+      },
+      "title": "Permissions",
+      "type": "object"
+    },
+    "Step": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "tool_id": {
+          "title": "Tool Id",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": true,
+          "title": "Inputs",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "tool_id",
+        "version"
+      ],
+      "title": "Step",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "manifest": {
+      "$ref": "#/$defs/Manifest"
+    },
+    "files": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Files",
+      "type": "object"
+    },
+    "binary_files": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Binary Files",
+      "type": "object"
+    }
+  },
+  "required": [
+    "manifest"
+  ],
+  "title": "Program",
+  "type": "object"
+}

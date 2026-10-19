@@ -1,0 +1,5 @@
+{
+  "root_task_id": "replace-with-actual-task",
+  "receipt_id": "replace-with-provider-receipt-id",
+  "cost": {"category": "main_llm", "input_tokens": 0, "output_tokens": 0, "amount": null, "currency": "USD"}
+}

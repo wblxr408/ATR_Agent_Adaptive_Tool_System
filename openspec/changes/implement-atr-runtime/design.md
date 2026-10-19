@@ -1,0 +1,33 @@
+# Design
+
+## Context
+
+参见 proposal.md。现有内容仅 docs/ATR_Agent_Adaptive_Tool_System_Plan_v1.md。宿主 Windows，有 Python 3.12、uv、Docker CLI；Docker 引擎可用性须在真实执行验收中确认。无既有 Agent、模型供应商或任务账单。
+
+## Goals / Non-Goals
+
+**Goals:** 落实全部 v1 控制路径，提供可嵌入 Python API、JSONL 五接口、CLI 和可复现示例。
+
+**Non-Goals:** 自动发布、私自调用付费模型、制造真实40任务样本或宣称已实现15%节省。
+
+## Decisions
+
+1. Pydantic 严格边界与 Draft 2020-12 JSON Schema；SQLite WAL 事务维护元数据、幂等与版本指针；FTS5 独立索引兼顾候选和工具。
+2. 默认 Docker 执行 Linux 镜像，非 root、cap-drop、no-new-privileges、network none、只读根、限定 tmpfs、CPU/内存/PID 和超时。仅挂载审查后的工作区快照/工作区和本次代码、输入、输出目录。无宿主命令回退。测试控制层可注入确定性的执行适配器，但其结果不得充当隔离证据。
+3. 控制目录默认位于用户数据目录，禁止位于工作区。只读工作区复制过滤敏感路径和符号链接，写工作区必须明确授权且不包含控制目录。生成代码不接触控制层 Python 对象。
+4. 内容寻址是产品存储机制；功能验收不执行 hash/checksum 比较。源码、Manifest、Review 用例与依赖版本统一固化，Review 执行真实期望输出用例，空测试不得准入。退出码与输出 schema 仅能证明结构。
+5. 根任务、operation_id、run_id、parent_run_id 区分业务操作与尝试。运行前事务占位；重复操作不重放。崩溃遗留运行标记不确定而非自动重试。
+6. 工作流由固定依赖和受限输入引用组成，控制层递归调度，无 eval 和动态命令拼接。依赖权限取闭包，父权限不得比子权限小。研究和模型请求经已配置宿主代理，适配器返回预算/来源数据；网页仅保存为数据。
+7. 采用可注入 UTC 时钟进行生命周期验收，固定观察窗与计数周期分离。归档下线但被引用版本保留可供依赖调用；恢复新周期从零计数。
+8. 本项目单 Agent 工具运行时，无 A2A、跨 Agent 委派或身份路由；Basic Memory 安全引用要求已查阅，多 Agent 专项基线当前无适用协议面。
+
+## Risks / Trade-offs
+
+- [Docker 未运行或镜像未准备] → 结构化失败并保留真实环境阻塞，不回退宿主运行。
+- [宿主适配器具有外网与模型权限] → 可信配置、只读网络白名单/SSRF 防护、预算、凭证按能力绑定，禁止动态提供 endpoint 或凭证。
+- [无法自动证明研究事实] → 保留 unknown 事实状态及引用；结构通过不表示事实成立。
+- [缺少真实账单与任务] → 交付采集器和严格对照报告，空数据返回 insufficient_data。
+
+## Migration Plan
+
+uv sync 建立本地环境；docker build 构建运行镜像；CLI init 创建独立控制目录；按示例创建、Review、执行工具。关闭动态执行可立即回到受控 Direct；旧版本通过事务切换恢复。数据库使用 schema_version 顺序迁移，未知版本拒绝打开。

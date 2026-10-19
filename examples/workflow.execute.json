@@ -1,0 +1,7 @@
+{
+  "root_task_id": "demo-workflow-execution",
+  "mode": "tool",
+  "tool_id": "project.numeric-analysis",
+  "inputs": {"first": [2, 3], "second": [7, -1]},
+  "operation_id": "numeric-analysis-1"
+}

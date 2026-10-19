@@ -1,0 +1,12 @@
+{
+  "project_key": "repo:demo",
+  "settings": {"image": "atr-sandbox:0.1", "max_task_cost": 1.0},
+  "policy": {
+    "allow_workspace_read": true,
+    "allow_workspace_write": false,
+    "network_capabilities": ["research"],
+    "secret_capabilities": []
+  },
+  "research": {"research": {"hosts": ["www.sqlite.org"], "maximum_sources": 5}},
+  "models": {}
+}

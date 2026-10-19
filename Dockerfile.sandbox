@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pytest==8.4.2 \
+    && mkdir -p /tool /workspace /out && chmod 1777 /out
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 65534:65534
+WORKDIR /workspace
+ENTRYPOINT ["python"]
