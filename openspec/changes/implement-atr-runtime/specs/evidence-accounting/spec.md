@@ -6,6 +6,13 @@
 
 ## ADDED Requirements
 
+### Requirement: Trusted aggregate budget and failed response evidence
+费用预留 SHALL 原子执行持久全局和宿主签发的任务预算。供应商已知用量及账单身份 SHALL 在响应异常时保留。JSON Artifact 的键和值 SHALL 脱敏，碰撞键不得静默覆盖。
+
+#### Scenario: Rotated identity cannot renew funds
+- **WHEN** 调用者伪造任务ID，或已签发任务耗尽聚合额度
+- **THEN** 不提交供应商请求，未知费用预留继续占用额度
+
 ### Requirement: Research provenance
 系统 SHALL 通过控制层配置的只读网络适配器获取研究数据，保存来源、检索日期和新鲜度，区分抓取、结构验证及事实核验；模型调用受能力和预算约束。
 

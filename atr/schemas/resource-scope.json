@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "read_paths": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Read Paths",
+      "type": "array"
+    },
+    "write_paths": {
+      "additionalProperties": {
+        "items": {
+          "enum": [
+            "create",
+            "update",
+            "delete"
+          ],
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "title": "Write Paths",
+      "type": "object"
+    },
+    "adapters": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Adapters",
+      "type": "array"
+    },
+    "tool_actions": {
+      "additionalProperties": {
+        "items": {
+          "enum": [
+            "create",
+            "review",
+            "restore",
+            "rollback",
+            "archive",
+            "purge"
+          ],
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "title": "Tool Actions",
+      "type": "object"
+    }
+  },
+  "title": "ResourceScope",
+  "type": "object"
+}

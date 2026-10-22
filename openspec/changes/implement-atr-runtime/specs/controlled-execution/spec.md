@@ -6,6 +6,24 @@
 
 ## ADDED Requirements
 
+### Requirement: Trusted task and concrete operation authority
+Runtime SHALL 拒绝缺少宿主任务上下文或具体操作许可的执行；许可绑定完整请求、资源操作、期限和稳定业务键。所有后代 SHALL 共享可信根任务的聚合限额；模型接口 SHALL NOT 签发凭证或批准。
+
+#### Scenario: Caller changes identity or request
+- **WHEN** Agent 伪造根任务、更换操作ID、修改已批准输入或写未批准路径
+- **THEN** 在发布工作区变更或提交供应商之前拒绝
+
+#### Scenario: Legitimate bound retry
+- **WHEN** 宿主已批准的同一操作不改负载提交两次
+- **THEN** 返回同一持久运行，业务效果仅执行一次
+
+### Requirement: Bounded shutdown and independent effects
+Runtime SHALL 在关闭时取消队列、停止接收，并等待活动调用退出后关闭元数据。工作区发布 SHALL 通过可信输出及完整预期变更检查。
+
+#### Scenario: Closing with queued write
+- **WHEN** 一个写调用排在活动调用后且服务开始关闭
+- **THEN** 排队运行终结为 cancelled，不产生写入
+
 ### Requirement: Fixed execution contract
 系统 SHALL 仅暴露 read、execute、tool_create、tool_review、tool_delete 五个模型接口，运行结果区分执行状态与业务验证状态，支持运行查询与取消。
 

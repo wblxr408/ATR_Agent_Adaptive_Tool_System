@@ -1,5 +1,15 @@
 {
-  "root_task_id": "demo-direct",
-  "argv": ["python", "-c", "import json; print(json.dumps({'sum': sum(json.load(open('input.json'))['numbers'])}))"],
-  "permissions": {"file_read": ["workspace"], "file_write": ["artifacts"]}
+  "argv": [
+    "python",
+    "-c",
+    "import json; print(json.dumps({'sum': sum(json.load(open('input.json'))['numbers'])}))"
+  ],
+  "permissions": {
+    "file_read": [
+      "workspace"
+    ],
+    "file_write": [
+      "artifacts"
+    ]
+  }
 }

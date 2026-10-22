@@ -222,7 +222,9 @@ class Registry:
                 raise ATRError("immutable_version", "tool version already exists")
             db.execute("INSERT OR IGNORE INTO task_budget(task) VALUES (?)", (task,))
             used = db.execute("SELECT creations FROM task_budget WHERE task=?", (task,)).fetchone()[0]
-            if used >= self.settings.max_creations_per_task:
+            authority = db.execute("SELECT max_creations FROM task_authority WHERE id=?", (task,)).fetchone()
+            creation_limit = min(self.settings.max_creations_per_task, authority[0]) if authority else self.settings.max_creations_per_task
+            if used >= creation_limit:
                 raise ATRError("creation_budget", "task tool creation budget exhausted")
             repairing = base_version is not None and db.execute(
                 "SELECT 1 FROM tools WHERE id=? AND state='quarantined'", (manifest.id,)).fetchone()
@@ -306,14 +308,23 @@ class Registry:
                         tool_id=tool_id, version=version)
         return {"tool_id": tool_id, "version": version, "state": state}
 
-    def rollback(self, tool_id: str, version: str) -> dict[str, str]:
+    def rollback(self, tool_id: str, version: str, *, expected_active: str | None = None) -> dict[str, str]:
         program, row = self.program(tool_id, version)
         self.policy.validate_manifest(program.manifest, self.project_key, self.environment)
         self._dependencies(program.manifest)
         if not row["reviewed"] or row["state"] not in ACTIVE:
             raise ATRError("review_required", "rollback requires an active reviewed version")
         with self.store.transaction() as db:
-            db.execute("INSERT INTO active VALUES (?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version",
-                       (tool_id, version))
+            current = db.execute("SELECT reviewed,state FROM tools WHERE id=? AND version=?",
+                                 (tool_id, version)).fetchone()
+            if not current or not current["reviewed"] or current["state"] not in ACTIVE:
+                raise ATRError("review_required", "rollback target changed before selection")
+            if expected_active is not None:
+                if not db.execute("UPDATE active SET version=? WHERE id=? AND version=?",
+                                  (version, tool_id, expected_active)).rowcount:
+                    raise ATRError("stale_version", "active version no longer matches the failed version")
+            else:
+                db.execute("INSERT INTO active VALUES (?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version",
+                           (tool_id, version))
         self.store.emit("tool_rollback", self.clock(), tool_id=tool_id, version=version)
         return {"tool_id": tool_id, "version": version}

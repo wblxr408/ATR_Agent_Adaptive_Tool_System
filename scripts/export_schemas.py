@@ -6,6 +6,7 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 
 from atr.agent_adapter import definitions
+from atr.control.authority import BehaviorRule, ResourceScope, TrustedCase
 from atr.models import (
     CreateRequest,
     Event,
@@ -20,7 +21,8 @@ destination = Path(__file__).resolve().parents[1] / "atr" / "schemas"
 destination.mkdir(exist_ok=True)
 contracts = {"manifest": Manifest, "program": Program, "execute-request": ExecuteRequest,
              "execution-result": ExecutionResult, "create-request": CreateRequest,
-             "review-report": ReviewReport, "event": Event}
+             "review-report": ReviewReport, "event": Event,
+             "resource-scope": ResourceScope, "behavior-rule": BehaviorRule, "trusted-case": TrustedCase}
 for name, model in contracts.items():
     schema = {"$schema": "https://json-schema.org/draft/2020-12/schema", **model.model_json_schema()}
     Draft202012Validator.check_schema(schema)

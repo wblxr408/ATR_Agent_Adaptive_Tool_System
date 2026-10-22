@@ -31,6 +31,7 @@ class SandboxSpec:
     policy: Policy
     max_workspace_bytes: int
     environment: str | None = None
+    max_workspace_files: int = 10000
 
 
 @dataclass
@@ -48,23 +49,27 @@ class Sandbox(Protocol):
     def run(self, spec: SandboxSpec, cancel: threading.Event) -> SandboxOutcome: ...
 
 
-def snapshot(workspace: Path, destination: Path, policy: Policy, maximum: int) -> None:
-    used = 0
+def snapshot(workspace: Path, destination: Path, policy: Policy, maximum: int,
+             max_files: int = 10000) -> None:
+    used = count = 0
     for root, dirs, files in os.walk(workspace, followlinks=False):
         base = Path(root)
         dirs[:] = [d for d in dirs if not is_link(base / d)
-                   and not policy.excluded((base / d).relative_to(workspace))]
+                   and not policy.excluded((base / d).relative_to(workspace))
+                   and policy.can_descend((base / d).relative_to(workspace))]
         target = destination / base.relative_to(workspace)
         target.mkdir(parents=True, exist_ok=True)
         for name in files:
             source = base / name
-            if is_link(source) or policy.excluded(source.relative_to(workspace)):
+            if (is_link(source) or policy.excluded(source.relative_to(workspace))
+                    or not policy.can_read(source.relative_to(workspace))):
                 continue
             if not source.is_file():
                 continue
             size = source.stat().st_size
             used += size
-            if used > maximum:
+            count += 1
+            if used > maximum or count > max_files:
                 raise ATRError("workspace_limit", "workspace snapshot exceeds configured byte budget")
             # Copy from an opened regular file; the snapshot never contains source links.
             with source.open("rb") as inp, (target / name).open("wb") as out:
@@ -106,9 +111,10 @@ class DockerSandbox:
             # Even write-capable executions get filtered staging. Changes are committed
             # under the project's write lock only after the process has stopped.
             if spec.permissions.file_read or "workspace" in spec.permissions.file_write:
-                snapshot(spec.workspace, work, spec.policy, spec.max_workspace_bytes)
+                snapshot(spec.workspace, work, spec.policy, spec.max_workspace_bytes, spec.max_workspace_files)
             writable = "workspace" in spec.permissions.file_write
-            baseline = self._collect(work, spec.max_workspace_bytes) if writable else {}
+            baseline = self._collect(work, spec.max_workspace_bytes,
+                max_files=spec.max_workspace_files, error_code="workspace_limit") if writable else {}
             container = "atr-" + uuid4().hex
             command = [self.executable, "run", "--rm", "--pull=never", "--name", container,
                        "--network=none", "--read-only", "--cap-drop=ALL",
@@ -138,7 +144,8 @@ class DockerSandbox:
                 if "artifacts" in spec.permissions.file_write:
                     outcome.files = self._collect(output, spec.limits.artifact_bytes)
                 if writable:
-                    changes = self._commit(work, spec.workspace, spec.policy, spec.max_workspace_bytes, baseline)
+                    changes = self._commit(work, spec.workspace, spec.policy, spec.max_workspace_bytes,
+                                           baseline, max_files=spec.max_workspace_files)
                     outcome.files["workspace_changes.json"] = json.dumps(changes, ensure_ascii=False).encode()
             return outcome
 
@@ -208,7 +215,8 @@ class DockerSandbox:
                               truncated=overflow.is_set(), error_code=error)
 
     @staticmethod
-    def _collect(output: Path, maximum: int) -> dict[str, bytes]:
+    def _collect(output: Path, maximum: int, *, max_files: int = 128,
+                 error_code: str = "artifact_limit") -> dict[str, bytes]:
         result: dict[str, bytes] = {}
         used = 0
         for root, dirs, files in os.walk(output, followlinks=False):
@@ -218,22 +226,23 @@ class DockerSandbox:
                 if is_link(path) or not path.is_file():
                     raise ATRError("unsafe_output", "sandbox output contains a link or non-file")
                 used += path.stat().st_size
-                if used > maximum or len(result) >= 128:
-                    raise ATRError("artifact_limit", "sandbox artifacts exceed budget")
+                if used > maximum or len(result) >= max_files:
+                    raise ATRError(error_code, "sandbox files exceed configured budget")
                 result[path.relative_to(output).as_posix()] = path.read_bytes()
         return result
 
     @classmethod
     def _commit(cls, staged: Path, workspace: Path, policy: Policy, maximum: int,
-                baseline: dict[str, bytes]) -> dict[str, object]:
-        targets, changes = cls._plan_commit(staged, workspace, policy, maximum, baseline)
+                baseline: dict[str, bytes], *, max_files: int = 10000) -> dict[str, object]:
+        targets, changes = cls._plan_commit(staged, workspace, policy, maximum, baseline, max_files=max_files)
         cls._apply_commit(targets)
         return changes
 
     @classmethod
     def _plan_commit(cls, staged: Path, workspace: Path, policy: Policy, maximum: int,
-                     baseline: dict[str, bytes]) -> tuple[list[tuple[Path, bytes | None]], dict[str, object]]:
-        files = cls._collect(staged, maximum)
+                     baseline: dict[str, bytes], *, max_files: int = 10000
+                     ) -> tuple[list[tuple[Path, bytes | None]], dict[str, object]]:
+        files = cls._collect(staged, maximum, max_files=max_files, error_code="workspace_limit")
         targets: list[tuple[Path, bytes | None]] = []
         diffs: list[str] = []
         changed: list[str] = []
@@ -245,7 +254,8 @@ class DockerSandbox:
             relative = Path(name)
             if policy.excluded(relative):
                 raise ATRError("permission_denied", "tool tried to write a protected workspace path")
-            target = policy.readable_path(workspace, name)
+            operation = "create" if before is None else ("delete" if content is None else "update")
+            target = policy.writable_path(workspace, name, operation)
             current = target.read_bytes() if target.is_file() else None
             if current != before:
                 raise ATRError("workspace_conflict", "workspace changed while the tool was running")

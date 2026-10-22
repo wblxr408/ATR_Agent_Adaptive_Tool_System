@@ -1,0 +1,35 @@
+[
+  {
+    "name": "host negative input",
+    "inputs": {
+      "numbers": [
+        3,
+        -1
+      ]
+    },
+    "rule": {
+      "checks": [
+        {
+          "expected": {
+            "sum": 2
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "host empty input",
+    "inputs": {
+      "numbers": []
+    },
+    "rule": {
+      "checks": [
+        {
+          "expected": {
+            "sum": 0
+          }
+        }
+      ]
+    }
+  }
+]

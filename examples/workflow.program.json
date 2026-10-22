@@ -1,0 +1,86 @@
+{
+  "manifest": {
+    "id": "project.numeric-analysis",
+    "project_key": "repo:demo",
+    "description": "Calculate two independent totals",
+    "kind": "workflow",
+    "input_schema": {
+      "type": "object",
+      "required": [
+        "first",
+        "second"
+      ],
+      "properties": {
+        "first": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "second": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "required": [
+        "first_total",
+        "second_total"
+      ]
+    },
+    "dependencies": [
+      {
+        "tool_id": "project.sum",
+        "version": "v1"
+      }
+    ],
+    "steps": [
+      {
+        "name": "first_total",
+        "tool_id": "project.sum",
+        "version": "v1",
+        "inputs": {
+          "numbers": {
+            "$input": "first"
+          }
+        }
+      },
+      {
+        "name": "second_total",
+        "tool_id": "project.sum",
+        "version": "v1",
+        "inputs": {
+          "numbers": {
+            "$input": "second"
+          }
+        }
+      }
+    ],
+    "checks": [
+      {
+        "inputs": {
+          "first": [
+            2,
+            3
+          ],
+          "second": [
+            7,
+            -1
+          ]
+        },
+        "expected": {
+          "first_total": {
+            "sum": 5
+          },
+          "second_total": {
+            "sum": 6
+          }
+        }
+      }
+    ]
+  }
+}

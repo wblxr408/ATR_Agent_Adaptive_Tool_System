@@ -1,0 +1,21 @@
+{
+  "scope": {
+    "read_paths": [
+      "input.json"
+    ],
+    "tool_actions": {
+      "project.sum": [
+        "create",
+        "review",
+        "rollback"
+      ],
+      "project.numeric-analysis": [
+        "create",
+        "review"
+      ]
+    }
+  },
+  "budget_usd": 1,
+  "max_calls": 64,
+  "ttl_seconds": 3600
+}

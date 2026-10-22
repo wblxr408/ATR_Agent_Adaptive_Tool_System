@@ -26,6 +26,8 @@ class Policy(Contract):
         ".claude", ".agents", "AGENTS.md", "CLAUDE.md", ".venv", "node_modules", "registry.sqlite3", "credentials.json",
         "id_rsa", "id_ed25519"])
     protected_relative_paths: list[str] = Field(default_factory=list)
+    read_paths: list[str] | None = None
+    write_rules: dict[str, list[str]] | None = None
 
     def authorize(self, permissions: Permissions, side_effect: str, limits: Limits,
                   *, adapter: bool = False) -> None:
@@ -59,9 +61,15 @@ class Policy(Contract):
                        adapter=manifest.kind != "script")
 
     def readable_path(self, workspace: Path, name: str) -> Path:
-        candidate = workspace / name
         if not self.allow_workspace_read:
             raise ATRError("permission_denied", "workspace reading is not granted")
+        candidate = self._safe_path(workspace, name)
+        if not self.can_read(candidate.resolve().relative_to(workspace.resolve())):
+            raise ATRError("permission_denied", "workspace path is outside the task's read grant")
+        return candidate
+
+    def _safe_path(self, workspace: Path, name: str) -> Path:
+        candidate = workspace / name
         try:
             relative = candidate.resolve().relative_to(workspace.resolve())
         except ValueError as exc:
@@ -70,6 +78,27 @@ class Policy(Contract):
                                           if p != workspace.parent):
             raise ATRError("permission_denied", "sensitive paths and links are excluded")
         return candidate
+
+    def can_read(self, relative: Path) -> bool:
+        if self.read_paths is None:
+            return True
+        name = relative.as_posix().casefold()
+        return any(name == item.casefold() or (item.endswith("/") and name.startswith(item.casefold()))
+                   for item in self.read_paths)
+
+    def can_descend(self, relative: Path) -> bool:
+        if self.read_paths is None:
+            return True
+        prefix = relative.as_posix().casefold().rstrip("/") + "/"
+        return self.can_read(relative) or any(item.casefold().startswith(prefix) for item in self.read_paths)
+
+    def writable_path(self, workspace: Path, name: str, operation: str) -> Path:
+        if not self.allow_workspace_write:
+            raise ATRError("permission_denied", "workspace writing is not granted")
+        if self.write_rules is not None and operation not in {
+                key.casefold(): value for key, value in self.write_rules.items()}.get(name.casefold(), []):
+            raise ATRError("permission_denied", "workspace operation is outside the task's path grant")
+        return self._safe_path(workspace, name)
 
     def excluded(self, relative: Path) -> bool:
         return any(relative.is_relative_to(Path(path)) for path in self.protected_relative_paths) or any(part.lower() in {x.lower() for x in self.excluded_names}

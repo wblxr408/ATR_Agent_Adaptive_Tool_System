@@ -116,12 +116,6 @@
         "ExecuteRequest": {
           "additionalProperties": false,
           "properties": {
-            "root_task_id": {
-              "maxLength": 200,
-              "minLength": 1,
-              "title": "Root Task Id",
-              "type": "string"
-            },
             "mode": {
               "default": "direct",
               "enum": [
@@ -249,20 +243,38 @@
               "default": false,
               "title": "Background",
               "type": "boolean"
+            },
+            "execution_environment": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Execution Environment"
             }
           },
-          "required": [
-            "root_task_id"
-          ],
+          "required": [],
           "title": "ExecuteRequest",
           "type": "object"
         },
         "Intent": {
           "additionalProperties": false,
           "properties": {
-            "root_task_id": {
-              "title": "Root Task Id",
-              "type": "string"
+            "operation_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Operation Id"
             },
             "summary": {
               "maxLength": 4096,
@@ -328,7 +340,6 @@
             }
           },
           "required": [
-            "root_task_id",
             "summary"
           ],
           "title": "Intent",
@@ -1022,11 +1033,6 @@
       },
       "additionalProperties": false,
       "properties": {
-        "root_task_id": {
-          "minLength": 1,
-          "title": "Root Task Id",
-          "type": "string"
-        },
         "program": {
           "anyOf": [
             {
@@ -1063,16 +1069,14 @@
           "title": "Base Version"
         }
       },
-      "required": [
-        "root_task_id"
-      ],
+      "required": [],
       "title": "CreateRequest",
       "type": "object"
     }
   },
   {
     "name": "tool_review",
-    "description": "Run expected-output checks, inspect evidence, restore or roll back a tool version.",
+    "description": "Run independent host-approved behavior cases, inspect evidence, restore or roll back a granted tool version.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -1091,18 +1095,6 @@
           ],
           "default": null,
           "title": "Version"
-        },
-        "root_task_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Root Task Id"
         },
         "action": {
           "default": "review",

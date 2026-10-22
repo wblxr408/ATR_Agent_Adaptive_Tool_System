@@ -21,6 +21,7 @@ from atr.models import Cost, Json
 class AdapterResponse:
     output: Any
     costs: list[Cost] = field(default_factory=list)
+    error_code: str | None = None
 
 
 class Adapter(Protocol):
@@ -166,12 +167,17 @@ class JSONModelAdapter:
             cost = Cost(category="nested_llm", input_tokens=incoming, output_tokens=outgoing,
                         cached_input_tokens=usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
                         amount=amount, provider=self.model, billing_ref=response.get("id"), estimated=amount is not None)
-            content = response["choices"][0]["message"]["content"]
+            try:
+                content = response["choices"][0]["message"]["content"]
+                if not isinstance(content, str):
+                    raise TypeError("content must be text")
+            except (KeyError, IndexError, TypeError):
+                return AdapterResponse(None, [cost], "adapter_contract")
             # Return raw content with usage even when invalid JSON, so billing is not lost.
             try:
                 output = json.loads(content)
             except (TypeError, ValueError):
-                output = {"invalid_json_output": content}
+                return AdapterResponse(None, [cost], "adapter_contract")
             return AdapterResponse(output, [cost])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ATRError("adapter_contract", "model provider returned an invalid envelope") from exc

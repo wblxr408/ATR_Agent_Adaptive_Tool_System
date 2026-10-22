@@ -1,0 +1,14 @@
+{
+  "checks": [
+    {
+      "expected": {
+        "first_total": {
+          "sum": 5
+        },
+        "second_total": {
+          "sum": 6
+        }
+      }
+    }
+  ]
+}

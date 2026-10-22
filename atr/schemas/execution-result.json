@@ -184,6 +184,12 @@
         }
       ],
       "default": null
+    },
+    "output_trust": {
+      "const": "untrusted",
+      "default": "untrusted",
+      "title": "Output Trust",
+      "type": "string"
     }
   },
   "required": [

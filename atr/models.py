@@ -201,6 +201,7 @@ class ExecuteRequest(Contract):
     limits: Limits = Field(default_factory=Limits)
     side_effect: Literal["pure", "read_only", "workspace_write", "external_write"] = "read_only"
     background: bool = False
+    execution_environment: str | None = None
 
     @model_validator(mode="after")
     def target(self) -> Self:
@@ -258,6 +259,7 @@ class ExecutionResult(Contract):
     candidate_id: str | None = None
     error_code: str | None = None
     suggested_fallback: Dependency | None = None
+    output_trust: Literal["untrusted"] = "untrusted"
 
 
 class CreateRequest(Contract):
@@ -286,6 +288,7 @@ class ReviewReport(Contract):
 
 class Intent(Contract):
     root_task_id: str
+    operation_id: str | None = None
     summary: str = Field(min_length=1, max_length=4096)
     tool_id: str | None = None
     inputs: Json = Field(default_factory=dict)
@@ -314,11 +317,13 @@ class Settings(Contract):
     max_repairs: int = Field(default=2, ge=0, le=10)
     max_creations_per_task: int = Field(default=8, ge=0, le=100)
     max_task_cost: float = Field(default=5, ge=0, allow_inf_nan=False)
+    max_total_cost: float = Field(default=50, ge=0, allow_inf_nan=False)
     raw_log_days: int = Field(default=30, ge=0, le=30)
     aggregate_days: int = Field(default=180, ge=1)
     max_concurrency: int = Field(default=4, ge=1, le=32)
     excerpt_chars: int = Field(default=2000, ge=64, le=16000)
     max_workspace_bytes: int = Field(default=67_108_864, ge=1024)
+    max_workspace_files: int = Field(default=10000, ge=1, le=1000000)
     image: str = "atr-sandbox:0.1"
     compute_usd_per_second: float | None = Field(default=None, ge=0)
     storage_usd_per_mb: float | None = Field(default=None, ge=0)

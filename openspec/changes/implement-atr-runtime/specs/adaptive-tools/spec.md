@@ -6,6 +6,13 @@
 
 ## ADDED Requirements
 
+### Requirement: Independent behavioral admission
+Tool Review SHALL 使用绑定不可变程序和环境的宿主验收案例。模型自拟检查 SHALL NOT 单独授予准入；固定历史版本失败 SHALL NOT 替换无关的活跃版本。
+
+#### Scenario: Self-authored checks conceal a backdoor
+- **WHEN** 程序能通过自拟检查但没有可信验收
+- **THEN** Review 拒绝准入并记录缺少可信证据
+
 ### Requirement: Retrieval before creation
 系统 SHALL 对 Tool 和 Candidate 先精确再模糊检索，过滤作用域、环境、输入和副作用；普通命令不捕获，歧义事件最多一次模型路由。
 

@@ -1,1 +1,10 @@
-{"root_task_id": "demo-reuse", "mode": "tool", "tool_id": "project.sum", "inputs": {"numbers": [5, 13]}, "operation_id": "sum-request-1"}
+{
+  "mode": "tool",
+  "tool_id": "project.sum",
+  "inputs": {
+    "numbers": [
+      5,
+      13
+    ]
+  }
+}

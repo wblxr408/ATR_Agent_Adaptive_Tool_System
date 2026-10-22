@@ -6,8 +6,9 @@ import json
 import tempfile
 import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,9 @@ from jsonschema.exceptions import ValidationError
 
 from atr.accounting import Ledger
 from atr.adapters import Adapter
+from atr.control.authority import BehaviorRule, ControlPlane, TaskContext
 from atr.control.lifecycle import Lifecycle
-from atr.control.registry import ACTIVE, RESTRICTED, Registry, signature
+from atr.control.registry import ACTIVE, RESTRICTED, Registry
 from atr.errors import ATRError
 from atr.models import (
     Cost,
@@ -72,6 +74,8 @@ class Runtime:
         self.router = Router(self.registry, route_model, self.ledger)
         self.sandbox, self.adapters = sandbox or DockerSandbox(self.settings.image), adapters or {}
         self.environment_resolved = environment is not None or not hasattr(self.sandbox, "fingerprint")
+        self.control = ControlPlane(self.store, self.settings, self.policy, clock, self._prepare_approval,
+                                    workspace=self.workspace)
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_concurrency,
                                            thread_name_prefix="atr-run")
         self.cancel_flags: dict[str, threading.Event] = {}
@@ -79,16 +83,68 @@ class Runtime:
         self.slots = threading.BoundedSemaphore(self.settings.max_concurrency)
         self.maintenance_stop = threading.Event()
         self.maintenance_thread: threading.Thread | None = None
+        self.state_condition = threading.Condition(threading.RLock())
+        self.closing = self.closed = False
+        self.owned_runs: set[str] = set()
+        self.futures: dict[str, Future[ExecutionResult]] = {}
+        self.run_contexts: dict[str, TaskContext] = {}
+        self.run_rules: dict[str, BehaviorRule | None] = {}
+        self.active_calls = 0
+
+    @contextmanager
+    def activity(self) -> Iterator[None]:
+        with self.state_condition:
+            if self.closing:
+                raise ATRError("runtime_closed", "runtime is closing")
+            self.active_calls += 1
+        try:
+            yield
+        finally:
+            with self.state_condition:
+                self.active_calls -= 1
+                self.state_condition.notify_all()
 
     def close(self) -> None:
+        with self.state_condition:
+            if self.closing:
+                self.state_condition.wait_for(lambda: self.closed)
+                return
+            self.closing = True
+            with self.store.transaction() as db:
+                db.executemany("UPDATE runs SET cancel_requested=1 WHERE id=? AND finished IS NULL",
+                               [(run_id,) for run_id in self.owned_runs])
+            with self.flag_lock:
+                for flag in self.cancel_flags.values():
+                    flag.set()
+            for run_id, future in list(self.futures.items()):
+                if future.cancel():
+                    result = ExecutionResult.model_validate_json(
+                        self.store.one("SELECT result FROM runs WHERE id=?", (run_id,))["result"])  # type: ignore[index]
+                    result.status, result.error_code = "cancelled", "cancelled"
+                    with self.store.transaction() as db:
+                        db.execute("UPDATE runs SET result=?,finished=?,eligible=0 WHERE id=?",
+                                   (canonical(result), self.clock().timestamp(), run_id))
+                    self._release_run(run_id)
         self.maintenance_stop.set()
         if self.maintenance_thread:
-            self.maintenance_thread.join(timeout=10)
-        with self.flag_lock:
-            for flag in self.cancel_flags.values():
-                flag.set()
-        self.executor.shutdown(wait=True)
+            self.maintenance_thread.join()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        with self.state_condition:
+            self.state_condition.wait_for(lambda: not self.owned_runs and self.active_calls == 0)
         self.store.close()
+        with self.state_condition:
+            self.closed = True
+            self.state_condition.notify_all()
+
+    def _release_run(self, run_id: str) -> None:
+        with self.state_condition:
+            self.owned_runs.discard(run_id)
+            self.futures.pop(run_id, None)
+            self.run_contexts.pop(run_id, None)
+            self.run_rules.pop(run_id, None)
+            with self.flag_lock:
+                self.cancel_flags.pop(run_id, None)
+            self.state_condition.notify_all()
 
     def start_maintenance(self) -> None:
         if self.maintenance_thread:
@@ -111,7 +167,23 @@ class Runtime:
         self.close()
 
     def _begin(self, request: ExecuteRequest, *, parent: str | None = None,
-               review: bool = False) -> tuple[str, ExecutionResult | None]:
+               review: bool = False, context: TaskContext | None = None,
+               rule: BehaviorRule | None = None) -> tuple[str, ExecutionResult | None]:
+        with self.state_condition:
+            if self.closing:
+                raise ATRError("runtime_closed", "runtime is closing")
+            self.control.authenticate(context, request.root_task_id)
+            assert context
+            run_id, previous = self._accept(request, parent=parent, review=review)
+            if previous is None:
+                self.run_contexts[run_id], self.run_rules[run_id] = context, rule
+                self.owned_runs.add(run_id)
+                with self.flag_lock:
+                    self.cancel_flags[run_id] = Cancellation(self.store, run_id)
+            return run_id, previous
+
+    def _accept(self, request: ExecuteRequest, *, parent: str | None = None,
+                review: bool = False) -> tuple[str, ExecutionResult | None]:
         now, run_id = self.clock(), "run_" + uuid4().hex
         result = ExecutionResult(run_id=run_id, mode=request.mode, tool_id=request.tool_id,
                                  version=request.version, status="running")
@@ -128,6 +200,14 @@ class Runtime:
                 previous = db.execute("SELECT * FROM runs WHERE id=?", (request.retry_of,)).fetchone()
                 if not previous or previous["task"] != request.root_task_id:
                     raise ATRError("invalid_retry", "retry target must belong to the same root task")
+            # Call admission and persistent run creation share one transaction.
+            authority = db.execute("SELECT calls,max_calls,expires,revoked FROM task_authority WHERE id=?",
+                                   (request.root_task_id,)).fetchone()
+            if not authority or authority["revoked"] or self.clock().timestamp() >= authority["expires"]:
+                raise ATRError("task_expired", "trusted task expired before admission")
+            if authority["calls"] >= authority["max_calls"]:
+                raise ATRError("task_calls", "trusted root task call budget exhausted")
+            db.execute("UPDATE task_authority SET calls=calls+1 WHERE id=?", (request.root_task_id,))
             bound_id, bound_version, epoch = request.tool_id, request.version, 0
             if request.mode == "tool":
                 assert request.tool_id
@@ -169,32 +249,70 @@ class Runtime:
             program.manifest.environment = self.environment
         return program
 
-    def execute(self, request: ExecuteRequest | Json) -> ExecutionResult:
+    def _prepare_approval(self, request: ExecuteRequest) -> ExecuteRequest:
+        request = request.model_copy(deep=True)
+        preview = request.program
+        if request.mode == "tool":
+            assert request.tool_id
+            preview, row = self.registry.program(request.tool_id, request.version)
+            request.version = row["version"]
+        self._refresh_environment(required=preview is None or preview.manifest.kind == "script")
+        request.execution_environment = self.environment
+        if request.program:
+            request.program = self._bind_program(request.program)
+        return request
+
+    def _trusted_closure(self, program: Program, seen: set[tuple[str, str]] | None = None) -> None:
+        visited = seen if seen is not None else set()
+        key = (program.manifest.id, program.manifest.version)
+        if key in visited:
+            return
+        visited.add(key)
+        self.control.acceptance(program)
+        for dependency in program.manifest.dependencies:
+            child, _ = self.registry.program(dependency.tool_id, dependency.version)
+            self._trusted_closure(child, visited)
+
+    def execute(self, request: ExecuteRequest | Json, *, context: TaskContext | None = None) -> ExecutionResult:
         request = ExecuteRequest.model_validate(request.model_dump(mode="json") if isinstance(request, ExecuteRequest) else request)
-        self.lifecycle.tick()
         try:
-            run_id, previous = self._begin(request)
+            with self.state_condition:
+                if self.closing:
+                    raise ATRError("runtime_closed", "runtime is closing")
+                rule = self.control.operation(context, request)  # type: ignore[arg-type]
+                self.lifecycle.tick()
+                run_id, previous = self._begin(request, context=context, rule=rule)
+                if previous:
+                    return previous
+                if request.background:
+                    self.futures[run_id] = self.executor.submit(self._run, request, run_id)
+                    return ExecutionResult(run_id=run_id, mode=request.mode, tool_id=request.tool_id,
+                                           version=request.version, status="running")
         except ATRError as exc:
             return ExecutionResult(run_id="", mode=request.mode, status="failed",
                                    error_code=exc.code, summary=str(exc))
-        if previous:
-            return previous
-        if request.background:
-            self.executor.submit(self._run, request, run_id)
-            return ExecutionResult(run_id=run_id, mode=request.mode, tool_id=request.tool_id,
-                                   version=request.version, status="running")
         return self._run(request, run_id)
 
     def _run(self, request: ExecuteRequest, run_id: str, *, parent: str | None = None,
              review: bool = False, supplied_program: Program | None = None,
              depth: int = 0, workspace_override: Path | None = None,
              deadline: float | None = None) -> ExecutionResult:
+        try:
+            return self._perform_run(request, run_id, parent=parent, review=review,
+                supplied_program=supplied_program, depth=depth, workspace_override=workspace_override,
+                deadline=deadline)
+        finally:
+            self._release_run(run_id)
+
+    def _perform_run(self, request: ExecuteRequest, run_id: str, *, parent: str | None = None,
+                     review: bool = False, supplied_program: Program | None = None,
+                     depth: int = 0, workspace_override: Path | None = None,
+                     deadline: float | None = None) -> ExecutionResult:
         started = time.monotonic()
         result = ExecutionResult(run_id=run_id, mode=request.mode, tool_id=request.tool_id,
                                  version=request.version, status="running")
-        flag = Cancellation(self.store, run_id)
         with self.flag_lock:
-            self.cancel_flags[run_id] = flag
+            flag = self.cancel_flags[run_id]
         acquired = project_locked = False
         program: Program | None = None
         row: dict[str, Any] | None = None
@@ -202,7 +320,16 @@ class Runtime:
         workspace_baseline: dict[str, bytes] = {}
         execution_workspace = workspace_override or self.workspace
         original_workspace = execution_workspace
+        context = self.run_contexts[run_id]
+        rule = self.run_rules[run_id]
+        policy = self.policy
         try:
+            authority = self.control.authenticate(context, request.root_task_id)
+            policy = self.control.scoped_policy(context)
+            if not parent and not review:
+                self.control.operation(context, request)
+            if flag.is_set():
+                raise ATRError("cancelled", "execution cancelled before starting")
             if depth > 16:
                 raise ATRError("dependency_depth", "maximum workflow depth exceeded")
             if self.store.one("SELECT id FROM runs WHERE id=? AND cancel_requested=1", (run_id,)):
@@ -217,8 +344,9 @@ class Runtime:
                     request = request.model_copy(update={"version": accepted_run["version"]})
                 assert request.tool_id
                 preview, _ = self.registry.program(request.tool_id, request.version)
-            if preview is None or preview.manifest.kind == "script":
-                self._refresh_environment(required=True)
+            self._refresh_environment(required=preview is None or preview.manifest.kind == "script")
+            if request.execution_environment is not None and request.execution_environment != self.environment:
+                raise ATRError("environment_mismatch", "operation environment differs from host approval")
             if request.program:
                 request = request.model_copy(update={"program": self._bind_program(request.program)})
             if not review and request.mode == "direct":
@@ -229,8 +357,8 @@ class Runtime:
                     self.policy.validate_manifest(proposed, self.project_key, self.environment)
                     Draft202012Validator(proposed.input_schema).validate(request.inputs)
                     self._check_effect_identity(request, proposed.side_effect)
-                request = self._reuse_or_observe(request)
-                result.mode = request.mode
+                self.store.emit("route_decided", self.clock(), task=request.root_task_id,
+                                decision="DIRECT", reason="host-approved fixed operation", model_calls=0)
             if not parent:
                 acquired = self.slots.acquire(blocking=False)
                 if not acquired:
@@ -259,8 +387,11 @@ class Runtime:
                     raise ATRError("timed_out", "parent workflow deadline exceeded")
                 limits = limits.model_copy(update={"timeout_seconds": min(limits.timeout_seconds, remaining)})
             deadline = time.monotonic() + limits.timeout_seconds
+            deadline = min(deadline, time.monotonic() + max(0, authority["expires"] - self.clock().timestamp()))
             side_effect = manifest.side_effect if manifest else request.side_effect
             if manifest:
+                assert program
+                self._trusted_closure(program)
                 self.policy.validate_manifest(manifest, self.project_key, self.environment)
                 self.registry._dependencies(manifest)
                 Draft202012Validator(manifest.input_schema).validate(request.inputs)
@@ -270,7 +401,9 @@ class Runtime:
                                (manifest.id if request.mode == "tool" or review else None, manifest.version,
                                 row["epoch"] if row else 0, run_id))
             else:
-                self.policy.authorize(permissions, side_effect, limits)
+                policy.authorize(permissions, side_effect, limits)
+            if not set(permissions.network) <= set(self.control.scope(context).adapters):
+                raise ATRError("permission_denied", "adapter capability is outside the trusted task scope")
             self._check_effect_identity(request, side_effect)
             if review and side_effect == "external_write" and not self.policy.allow_external_review:
                 raise ATRError("external_review_denied", "external side-effect review requires a distinct operator grant")
@@ -282,8 +415,10 @@ class Runtime:
                 project_locked = True
                 workspace_area = tempfile.TemporaryDirectory(prefix="atr-workspace-")
                 execution_workspace = Path(workspace_area.name)
-                snapshot(original_workspace, execution_workspace, self.policy, self.settings.max_workspace_bytes)
-                workspace_baseline = DockerSandbox._collect(execution_workspace, self.settings.max_workspace_bytes)
+                snapshot(original_workspace, execution_workspace, policy, self.settings.max_workspace_bytes,
+                         self.settings.max_workspace_files)
+                workspace_baseline = DockerSandbox._collect(execution_workspace, self.settings.max_workspace_bytes,
+                    max_files=self.settings.max_workspace_files, error_code="workspace_limit")
             if flag.is_set():
                 raise ATRError("cancelled", "execution cancelled")
             if manifest and manifest.kind == "workflow":
@@ -298,8 +433,9 @@ class Runtime:
                 assert argv is not None
                 outcome = self.sandbox.run(SandboxSpec(
                     argv, canonical(request.inputs).encode(), program.sandbox_files() if program else {},
-                    execution_workspace, permissions, limits, self.policy, self.settings.max_workspace_bytes,
-                    self.environment if hasattr(self.sandbox, "fingerprint") and not self.environment_override else None), flag)
+                    execution_workspace, permissions, limits, policy, self.settings.max_workspace_bytes,
+                    self.environment if hasattr(self.sandbox, "fingerprint") and not self.environment_override else None,
+                    self.settings.max_workspace_files), flag)
             if time.monotonic() > deadline:
                 outcome.status, outcome.error_code = "timed_out", "timed_out"
             if flag.is_set():
@@ -319,14 +455,29 @@ class Runtime:
                 except (ValidationError, ValueError, UnicodeError):
                     result.validation_status, result.status = "failed", "failed"
                     result.error_code = "output_contract"
+            if result.status == "succeeded" and rule:
+                rule.validate_output(outcome.stdout)
+                if not workspace_area:
+                    rule.validate_changes({}, {})
+                result.validation_status = "passed"
+            self.control.authenticate(context, request.root_task_id)
+            if program:
+                self._trusted_closure(program)
+            if not parent and not review:
+                self.control.operation(context, request)
             if workspace_area:
                 # A child may have committed to the root's staging directory. Only
                 # the fully validated root may publish changes to the user project.
                 outcome.files.pop("workspace_changes.json", None)
-                if result.status == "succeeded" and not review:
+                if result.status == "succeeded":
                     targets, changes = DockerSandbox._plan_commit(
-                        execution_workspace, original_workspace, self.policy,
-                        self.settings.max_workspace_bytes, workspace_baseline)
+                        execution_workspace, original_workspace, policy,
+                        self.settings.max_workspace_bytes, workspace_baseline,
+                        max_files=self.settings.max_workspace_files)
+                    if rule:
+                        after = DockerSandbox._collect(execution_workspace, self.settings.max_workspace_bytes,
+                            max_files=self.settings.max_workspace_files, error_code="workspace_limit")
+                        rule.validate_changes(workspace_baseline, after)
                     outcome.files["workspace_changes.json"] = canonical(changes).encode()
                     if sum(len(v) for v in outcome.files.values()) > limits.artifact_bytes:
                         raise ATRError("artifact_limit", "workspace change report exceeds artifact budget")
@@ -334,7 +485,16 @@ class Runtime:
                         raise ATRError("cancelled", "execution cancelled before workspace publication")
                     if time.monotonic() > deadline:
                         raise ATRError("timed_out", "execution deadline exceeded before workspace publication")
-                    DockerSandbox._apply_commit(targets)
+                    if not review:
+                        # Revocation and publication serialize on the control transaction.
+                        with self.store.transaction():
+                            self.control.authenticate(context, request.root_task_id)
+                            self.control.operation(context, request)
+                            if program:
+                                self._trusted_closure(program)
+                            if flag.is_set():
+                                raise ATRError("cancelled", "execution cancelled before publication")
+                            DockerSandbox._apply_commit(targets)
             stdout = self.redactor.text(outcome.stdout.decode("utf-8", errors="replace"))
             result.stdout_excerpt = stdout[:self.settings.excerpt_chars]
             result.truncated |= len(stdout) > self.settings.excerpt_chars
@@ -374,8 +534,8 @@ class Runtime:
                                key=lambda value: int(value[1:]), reverse=True)
                 if older:
                     try:
-                        self.registry.rollback(row["id"], older[0])
                         result.suggested_fallback = Dependency(tool_id=row["id"], version=older[0])
+                        self.registry.rollback(row["id"], older[0], expected_active=row["version"])
                     except ATRError:
                         self.store.emit("fallback_unavailable", self.clock(), task=request.root_task_id,
                                         run_id=run_id, tool_id=row["id"], version=older[0])
@@ -399,8 +559,6 @@ class Runtime:
                 self.slots.release()
             if workspace_area:
                 workspace_area.cleanup()
-            with self.flag_lock:
-                self.cancel_flags.pop(run_id, None)
             self.ledger.record(request.root_task_id, Cost(category="compute", amount=(
                 (time.monotonic() - started) * self.settings.compute_usd_per_second
                 if self.settings.compute_usd_per_second is not None else None),
@@ -414,8 +572,8 @@ class Runtime:
                             run_id=run_id, tool_id=result.tool_id, version=result.version,
                             status=result.status, validation_status=result.validation_status,
                             duration_ms=result.duration_ms, eligible=eligible, parent_run_id=parent)
-        if row and not review:
-            self.lifecycle.tick()
+            if row and not review:
+                self.lifecycle.tick()
         return result
 
     @staticmethod
@@ -436,7 +594,22 @@ class Runtime:
             raise ATRError("adapter_unavailable", "tool requires an operator-configured network capability")
         if not set(adapter.required_secrets) <= set(manifest.permissions.secrets):
             raise ATRError("permission_denied", "tool must declare the adapter's secret capabilities")
+        root_run = run_id
+        while True:
+            parent = self.store.one("SELECT parent,operation,review_run FROM runs WHERE id=?", (root_run,))
+            if not parent or not parent["parent"]:
+                break
+            root_run = parent["parent"]
+        if parent and not parent["review_run"] and not self.store.one(
+                "SELECT id FROM operation_authority WHERE id=? AND task=? AND revoked=0",
+                (parent["operation"], request.root_task_id)):
+            raise ATRError("operation_authority", "root operation was revoked before provider submission")
+        root_rule = self.run_rules[root_run]
+        if root_rule is None:
+            raise ATRError("permission_denied", "provider calls require root behavioral authority")
+        self.control.consume_adapter(root_run, root_rule, capability or "", request.inputs)
         maximum = adapter.max_cost_usd
+        self.control.authenticate(self.run_contexts[run_id], request.root_task_id)
         reservation = self.ledger.reserve(request.root_task_id, maximum, run_id)
         recorded = False
         complete = False
@@ -444,6 +617,9 @@ class Runtime:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ATRError("timed_out", "adapter time budget exhausted")
+            self.control.authenticate(self.run_contexts[run_id], request.root_task_id)
+            if flag.is_set():
+                raise ATRError("cancelled", "adapter cancelled before provider submission")
             response = adapter.call(request.inputs, timeout=remaining,
                                     cancel=flag, now=self.clock())
             total = 0.0
@@ -457,6 +633,8 @@ class Runtime:
             complete = recorded and all(c.amount is not None and not c.estimated for c in response.costs)
             if total > maximum:
                 raise ATRError("adapter_budget", "adapter exceeded its declared maximum charge")
+            if response.error_code:
+                raise ATRError(response.error_code, "provider response failed its contract; billing evidence retained")
             return response.output
         finally:
             if not recorded:
@@ -464,49 +642,6 @@ class Runtime:
                     "nested_llm" if manifest.kind == "model_pipeline" else "external_api"),
                     provider=capability), run_id, entry_id=reservation + ":unknown")
             self.ledger.release(reservation, billing_complete=complete)
-
-    def _reuse_or_observe(self, request: ExecuteRequest) -> ExecuteRequest:
-        program = request.program
-        if not program or not request.generated_independent:
-            self.store.emit("route_decided", self.clock(), task=request.root_task_id,
-                            decision="DIRECT", reason="ordinary command or explicit task program", model_calls=0)
-            return request
-        matches = self.registry.search(program.manifest.id, inputs=request.inputs,
-                                       side_effect=program.manifest.side_effect)
-        selected = None
-        for match in matches:
-            other, _ = (self.registry.candidate(match["id"]) if match["entity"] == "candidate"
-                        else self.registry.program(match["id"], match["version"]))
-            if signature(other) != signature(program):
-                continue
-            if match["entity"] == "candidate":
-                try:
-                    created = self.tool_create(CreateRequest(root_task_id=request.root_task_id,
-                                                            candidate_id=match["id"]))
-                except ATRError as exc:
-                    self.store.emit("candidate_registration_deferred", self.clock(),
-                                    task=request.root_task_id, candidate_id=match["id"], reason=exc.code)
-                    break
-                if program.manifest.side_effect == "external_write":
-                    self.store.emit("candidate_review_deferred", self.clock(), task=request.root_task_id,
-                                    tool_id=created["tool_id"], version=created["version"],
-                                    reason="external effects require an explicit review request")
-                    break
-                report = self.tool_review(created["tool_id"], created["version"], root_task_id=request.root_task_id)
-                if not isinstance(report, ReviewReport) or not report.passed:
-                    # Original program is still available for a controlled Direct attempt.
-                    break
-                selected = created
-            else:
-                selected = {"tool_id": match["id"], "version": match["version"]}
-            break
-        self.store.emit("route_decided", self.clock(), task=request.root_task_id,
-                        decision="REUSE" if selected else "EXECUTE_AND_OBSERVE", model_calls=0,
-                        retrieved=[m["id"] for m in matches], selected=selected)
-        if selected:
-            return request.model_copy(update={"mode": "tool", "tool_id": selected["tool_id"],
-                "version": selected["version"], "program": None, "generated_independent": False})
-        return request
 
     @staticmethod
     def _resolve(value: Any, inputs: Json, outputs: Json) -> Any:
@@ -545,7 +680,8 @@ class Runtime:
                                    inputs=self._resolve(step.inputs, request.inputs, outputs),
                                    operation_id=f"{run_id}:{step.name}",
                                    retry_of=request.retry_of, cache_hit=request.cache_hit)
-            child_id, previous = self._begin(child, parent=run_id, review=review)
+            child_id, previous = self._begin(child, parent=run_id, review=review,
+                                             context=self.run_contexts[run_id])
             result = previous or self._run(child, child_id, parent=run_id, depth=depth + 1,
                 review=review, workspace_override=workspace, deadline=deadline)
             if result.status != "succeeded" or result.validation_status != "passed":
@@ -557,7 +693,16 @@ class Runtime:
         artifact = next((a for a in result.artifacts if a.name == "stdout"), None)
         return json.loads(self.store.get(artifact.ref)) if artifact else None
 
-    def read(self, operation: str, **kwargs: Any) -> Any:
+    def read(self, operation: str, *, context: TaskContext | None = None, **kwargs: Any) -> Any:
+        with self.activity():
+            return self._read(operation, context=context, **kwargs)
+
+    def _read(self, operation: str, *, context: TaskContext | None = None, **kwargs: Any) -> Any:
+        policy = self.policy
+        if context is not None:
+            self.control.authenticate(context)
+            self.control.consume_call(context)
+            policy = self.control.scoped_policy(context)
         if operation == "registry_search":
             self.lifecycle.tick()
             self._refresh_environment()
@@ -574,7 +719,7 @@ class Runtime:
                     "next_offset": offset + min(limit, max(0, len(content) - offset)),
                     "truncated": offset + limit < len(content)}
         if operation == "workspace_read":
-            path = self.policy.readable_path(self.workspace, kwargs["path"])
+            path = policy.readable_path(self.workspace, kwargs["path"])
             offset, limit = kwargs.get("offset", 0), kwargs.get("limit", 4096)
             if not isinstance(offset, int) or offset < 0 or not isinstance(limit, int) or not 1 <= limit <= 16000:
                 raise ATRError("invalid_range", "invalid read range")
@@ -587,11 +732,17 @@ class Runtime:
             return {"text": content.decode("utf-8", errors="replace"),
                     "next_offset": offset + len(content), "truncated": offset + len(content) < len(redacted)}
         if operation == "run_output":
+            if context is not None and not self.store.one(
+                    "SELECT 1 FROM artifacts a JOIN runs r ON r.id=a.run_id WHERE a.ref=? AND r.task=?",
+                    (kwargs["ref"], context.root_task_id)):
+                raise ATRError("permission_denied", "artifact does not belong to the bound task")
             return self.store.read_artifact(**kwargs)
         if operation == "run":
-            row = self.store.one("SELECT result FROM runs WHERE id=?", (kwargs["run_id"],))
+            row = self.store.one("SELECT task,result FROM runs WHERE id=?", (kwargs["run_id"],))
             if not row:
                 raise ATRError("not_found", "run not found")
+            if context is not None and row["task"] != context.root_task_id:
+                raise ATRError("permission_denied", "run does not belong to the bound task")
             return json.loads(row["result"])
         if operation == "tool":
             program, row = self.registry.program(kwargs["tool_id"], kwargs.get("version"))
@@ -603,7 +754,11 @@ class Runtime:
             return {"manifest": program.manifest.model_dump(mode="json"), "state": row["state"]}
         raise ATRError("invalid_operation", "unknown read operation")
 
-    def tool_create(self, request: CreateRequest | Json) -> Json:
+    def tool_create(self, request: CreateRequest | Json, *, context: TaskContext | None = None) -> Json:
+        with self.activity():
+            return self._tool_create(request, context=context)
+
+    def _tool_create(self, request: CreateRequest | Json, *, context: TaskContext | None = None) -> Json:
         request = CreateRequest.model_validate(request.model_dump(mode="json") if isinstance(request, CreateRequest) else request)
         if not self.store.enabled("auto_create"):
             raise ATRError("creation_disabled", "tool creation is paused")
@@ -612,6 +767,9 @@ class Runtime:
         else:
             assert request.program
             program = request.program
+        self.control.authenticate(context, request.root_task_id)
+        assert context
+        self.control.authorize_tool(context, program.manifest.id, "create")
         self._refresh_environment()
         program = self._bind_program(program)
         matches = self.registry.search(program.manifest.id, include_inactive=True)
@@ -620,39 +778,55 @@ class Runtime:
         return self.registry.create(program, request.root_task_id, request.base_version)
 
     def tool_review(self, tool_id: str, version: str | None = None, *,
-                    root_task_id: str | None = None, action: str = "review") -> ReviewReport | Json:
+                    root_task_id: str | None = None, action: str = "review",
+                    context: TaskContext | None = None) -> ReviewReport | Json:
+        with self.activity():
+            return self._tool_review(tool_id, version, root_task_id=root_task_id, action=action, context=context)
+
+    def _tool_review(self, tool_id: str, version: str | None = None, *,
+                     root_task_id: str | None = None, action: str = "review",
+                     context: TaskContext | None = None) -> ReviewReport | Json:
         if action == "rollback":
+            self.control.authenticate(context, root_task_id)
+            assert context
+            self.control.authorize_tool(context, tool_id, action)
             if not version:
                 raise ATRError("version_required", "rollback requires a pinned version")
+            target, _ = self.registry.program(tool_id, version)
+            self._trusted_closure(target)
             return self.registry.rollback(tool_id, version)
         program, row = self.registry.program(tool_id, version)
         if action == "evidence":
             return json.loads(row["review"]) if row["review"] else {"passed": False, "errors": ["not reviewed"]}
         if action not in ("review", "restore"):
             raise ATRError("invalid_operation", "unknown review action")
-        manifest, task = program.manifest, root_task_id or "review:" + tool_id
+        manifest = program.manifest
+        task = root_task_id or (context.root_task_id if context else "unbound-review")
         report = ReviewReport(tool_id=tool_id, version=manifest.version, checked_at=self.clock(), passed=False)
         try:
+            self.control.authenticate(context, task)
+            assert context
+            self.control.authorize_tool(context, tool_id, action)
+        except ATRError as exc:
+            # An unauthorised Review must not quarantine someone else's tool.
+            report.errors.append(exc.code)
+            return report
+        try:
+            self._refresh_environment(required=manifest.kind == "script")
+            cases = self.control.acceptance(program)
+            self.control.authenticate(context, task)
+            assert context
+            self.control.authorize_tool(context, tool_id, action)
             if not self.store.enabled("dynamic_execute"):
                 raise ATRError("dynamic_disabled", "review execution is disabled")
             self.policy.validate_manifest(manifest, self.project_key, self.environment)
             self.registry._dependencies(manifest)
-            if not manifest.checks:
-                raise ATRError("checks_required", "at least one expected-output contract case is required")
-            for check in manifest.checks:
+            for check in cases:
                 request = ExecuteRequest(root_task_id=task, program=program,
                                          inputs=check.inputs, operation_id="review:" + uuid4().hex)
-                run_id, _ = self._begin(request, review=True)
+                run_id, _ = self._begin(request, review=True, context=context, rule=check.rule)
                 result = self._run(request, run_id, review=True, supplied_program=program)
-                actual = self.output(result) if result.status == "succeeded" else None
-                found = True
-                if check.expected_path and actual is not None:
-                    try:
-                        for component in check.expected_path.split("."):
-                            actual = actual[component]
-                    except (KeyError, TypeError):
-                        found = False
-                passed = result.status == "succeeded" and found and actual == check.expected
+                passed = result.status == "succeeded" and result.validation_status == "passed"
                 report.evidence.append({"name": check.name, "run_id": run_id, "passed": passed,
                                         "status": result.status, "validation_status": result.validation_status})
                 if not passed:
@@ -663,10 +837,16 @@ class Runtime:
         now = self.clock()
         report.environment = self.environment
         with self.store.transaction() as db:
-            current = db.execute("SELECT state FROM tools WHERE id=? AND version=?",
+            self.control.authenticate(context, task)
+            current = db.execute("SELECT * FROM tools WHERE id=? AND version=?",
                                  (tool_id, manifest.version)).fetchone()
             if not current or current["state"] == State.DELETED:
                 raise ATRError("not_found", "tool version was deleted during review")
+            if any(current[key] != row[key] for key in ("epoch", "state", "review")):
+                raise ATRError("stale_review", "tool state changed during review; evidence cannot replace it")
+            if report.passed:
+                self.control.authenticate(context, task)
+                self.control.acceptance(program)
             state = row["state"]
             restoring = state in (State.ARCHIVED, State.DORMANT, State.DISABLED, State.QUARANTINED)
             if report.passed:
@@ -689,15 +869,42 @@ class Runtime:
                         version=manifest.version, passed=report.passed, evidence=report.evidence)
         return report
 
-    def tool_delete(self, tool_id: str, version: str | None = None, *, purge: bool = False) -> Json:
-        return self.registry.delete(tool_id, version, purge=purge)
+    def tool_delete(self, tool_id: str, version: str | None = None, *, purge: bool = False,
+                    context: TaskContext | None = None) -> Json:
+        with self.activity():
+            self.control.authenticate(context)
+            assert context
+            self.control.authorize_tool(context, tool_id, "purge" if purge else "archive")
+            return self.registry.delete(tool_id, version, purge=purge)
 
-    def route(self, intent: Intent) -> Any:
-        self.lifecycle.tick()
-        self._refresh_environment()
-        return self.router.route(intent)
+    def route(self, intent: Intent, *, context: TaskContext | None = None) -> Any:
+        with self.activity():
+            self.control.authenticate(context, intent.root_task_id)
+            assert context
+            if self.router.model is not None:
+                previous = self.control.begin_route(context, intent)
+                if previous:
+                    return previous
+            else:
+                self.control.consume_call(context)
+            self.lifecycle.tick()
+            self._refresh_environment()
+            result = self.router.route(intent)
+            if self.router.model is not None:
+                with self.store.transaction() as db:
+                    db.execute("UPDATE route_results SET result=? WHERE operation=?",
+                               (canonical(result), intent.operation_id))
+            return result
 
-    def cancel(self, run_id: str) -> Json:
+    def cancel(self, run_id: str, *, context: TaskContext | None = None) -> Json:
+        with self.activity():
+            return self._cancel(run_id, context=context)
+
+    def _cancel(self, run_id: str, *, context: TaskContext | None = None) -> Json:
+        if context is not None:
+            self.control.authenticate(context)
+            if not self.store.one("SELECT id FROM runs WHERE id=? AND task=?", (run_id, context.root_task_id)):
+                raise ATRError("permission_denied", "run does not belong to the bound task")
         with self.store.transaction() as db:
             rows = db.execute("""WITH RECURSIVE chain(id) AS (
                 SELECT id FROM runs WHERE id=? UNION ALL

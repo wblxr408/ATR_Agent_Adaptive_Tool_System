@@ -1,262 +1,144 @@
-# ATR — Adaptive Tool Runtime
+# ATR · Agent Adaptive Tool Runtime
 
-**让 Coding / Research Agent 将重复使用的独立程序，逐步沉淀为可检索、可验证、可管理的工具。**
+ATR 是单用户、本地部署的 Agent 工具运行时，提供受控执行、工具注册与复用、固定版本工作流、生命周期管理和费用记录。
 
-ATR 是一个面向单用户 Agent 的 Python 运行时，提供命令执行、程序捕获、工具复用、生命周期管理及成本记录。主 Agent 负责理解任务和生成程序，ATR 负责执行与管理。无论工具库如何增长，模型侧始终使用固定五接口。
+**0.2.0 将调用 Agent 本身也视为不可信。** 宿主签发任务身份、预算和操作许可；Agent 通过固定五接口提交已获准请求。生成程序在 Docker 中运行，网络与模型访问通过宿主配置的代理。
 
-技术栈：**Python 3.12+ · SQLite WAL / FTS5 · Docker · Pydantic · JSON Schema**。
+## 能力与边界
 
-## 适合什么场景
-
-- **Coding**：复用异常分析、日志处理、数据转换等独立程序，并记录其执行和验证结果。
-- **Research**：把检索、证据获取和模型处理组织成带来源记录的流程，更新资料时重新获取证据。
-- **Agent 集成**：通过 Python API 或 JSONL 协议，把工具执行与管理接到现有 Agent 中。
-
-普通命令直接执行；新生成且成功执行的独立程序可以保存为 Candidate；重复需求命中候选后，系统注册工具、运行契约用例并尝试复用。项目业务源码修改默认作为任务产物处理。
-
-## 核心能力
-
-| 能力 | 实现内容 |
+| 能力 | 实现 |
 |---|---|
-| 固定五接口 | `read`、`execute`、`tool_create`、`tool_review`、`tool_delete` |
-| 受控执行 | Docker 默认隔离、权限声明、环境检查、资源约束、取消和运行查询 |
-| 检索与捕获 | 精确匹配、FTS5、作用域和输入输出兼容性过滤、独立程序托管副本 |
-| 生命周期 | Candidate → Temporary → Persistent，以及归档、休眠、复检和清理 |
-| 版本与依赖 | 不可变版本、固定依赖、引用保护、Review 和原子版本回滚 |
-| 工作流 | 多步骤工具组合，支持输入和前序步骤结果引用 |
-| Research / 模型 | HTTPS 主机白名单、来源和时间记录、命名模型与凭证适配器 |
-| 可观测性 | 任务与运行事件、输出 Artifact、脱敏、Token 和货币费用分别报告 |
-| 预算 | 调用前预留费用上界，缺失账单保留预算，实际凭证结算去重 |
+| 可信控制层 | 持久任务凭证、固定期限、共享调用/创建/费用限额、持久全局费用上限 |
+| 具体授权 | 固定程序或版本、输入、环境和业务键；文件读取与创建/修改/删除分别授权 |
+| 独立验收 | 宿主提供程序案例与每操作结果/文件规则，Agent 自拟 checks 不能授予准入 |
+| 执行隔离 | 非 root Docker、无网络、只读根、CPU/内存/PID/超时/输出限制 |
+| 工具管理 | Candidate、Registry、FTS5、不可变版本、Review、固定依赖与生命周期 |
+| 工作流 | 后代共享根权限、预算、截止时间和暂存，完整根调用通过后提交 |
+| 费用 | Token、已知/估计/未知金额、调用前预留、真实账单结算及去重 |
+| 退出与状态 | 关闭取消活动及排队任务；旧版本失败不会回退无关健康版本 |
 
-## 架构
+宿主程序、配置、签发接口和控制目录必须可信。ATR 不隔离拥有任意宿主 shell 或控制目录写权限的同用户程序。验收只证明满足已配置规则，不能证明任意程序没有后门，也不能保证主 Agent 不受输出中的提示注入影响。执行输出统一标记 untrusted。
 
-```mermaid
-flowchart TD
-    Agent[主 Agent] --> API[固定五接口 / Python API / JSONL]
-    API --> Router[规则路由与兼容性检索]
-    Router <--> Registry[Candidate / Registry / SQLite FTS5]
-    Router --> Dispatcher[统一执行入口]
-    Dispatcher --> Sandbox[Direct / Script：Docker 沙盒]
-    Dispatcher --> Workflow[Workflow：固定依赖调度]
-    Dispatcher --> Proxy[Research / Model：受信适配器]
-    Workflow --> Dispatcher
-    Sandbox --> Result[摘要 / Artifact / 执行状态]
-    Proxy --> Result
-    Result --> Agent
-    Registry <--> Lifecycle[Review / 版本 / 生命周期]
-    Dispatcher --> Events[结构化事件 / 费用与预算]
-```
+## 安装
 
-控制数据库、策略和凭证由宿主控制层管理；动态程序在单独执行环境中运行。完整设计见 [实施计划](docs/plan.md)，详细执行约束见 [运行说明](docs/runtime.md)。
+需要 Python 3.12+、uv 和 Linux Docker 引擎。
 
-## 快速开始
-
-需要 Python 3.12+、[uv](https://docs.astral.sh/uv/) 和支持 Linux 容器的 Docker 引擎。以下命令从仓库根目录执行。
-
-### 1. 获取代码并准备环境
-
-```bash
+~~~powershell
 git clone https://github.com/wblxr408/ATR_Agent_Adaptive_Tool_System.git
 cd ATR_Agent_Adaptive_Tool_System
 uv sync --python 3.12
 docker build -f Dockerfile.sandbox -t atr-sandbox:0.1 .
-```
+~~~
 
-示例使用 `examples/workspace` 作为工具工作区，`examples/operator.example.json` 作为操作者配置。两者分离，配置中已统一设置 `project_key=repo:demo`。示例不需要模型 API Key。
+正式镜像完整构建此前受 Debian 软件源下载停滞影响，尚无成功记录。当前真实容器验收使用同基础的独立 Python 验证镜像，详见[安全修复与证据](docs/security-hardening.md)。
 
-### 2. 运行命令，观察候选并复用
+## 快速开始
 
-**PowerShell：**
+以下命令在 PowerShell 7 中运行。工具工作区为 examples/workspace；配置、授权和凭证均在该目录之外。.atr-demo/ 已被 Git 忽略。
 
-```powershell
+~~~powershell
+New-Item -ItemType Directory -Force .atr-demo | Out-Null
 $atrArgs = @('--workspace', 'examples/workspace', '--config', 'examples/operator.example.json')
-
 uv run atr @atrArgs init
-uv run atr @atrArgs execute examples/direct.json
-uv run atr @atrArgs execute examples/observe.json
-uv run atr @atrArgs execute examples/observe-repeat.json
-uv run atr @atrArgs execute examples/tool.execute.json
-uv run atr @atrArgs search sum
-uv run atr @atrArgs tools
-```
 
-**Bash / Zsh：**
+# 仅操作者执行：签发固定期限、64次调用、1美元上限的任务。
+uv run atr @atrArgs issue-task examples/host-task.json --output .atr-demo/task.json
+$hostArgs = $atrArgs + @('--task-context', '.atr-demo/task.json')
 
-```bash
-atr_args=(--workspace examples/workspace --config examples/operator.example.json)
+# 仅操作者执行：核对请求和预期结果后，签发固定操作许可。
+uv run atr @hostArgs approve-operation examples/direct.json --business-key sum-input-once --acceptance examples/direct.acceptance.json |
+  Set-Content -Encoding utf8NoBOM .atr-demo/approved.json
 
-uv run atr "${atr_args[@]}" init
-uv run atr "${atr_args[@]}" execute examples/direct.json
-uv run atr "${atr_args[@]}" execute examples/observe.json
-uv run atr "${atr_args[@]}" execute examples/observe-repeat.json
-uv run atr "${atr_args[@]}" execute examples/tool.execute.json
-uv run atr "${atr_args[@]}" search sum
-uv run atr "${atr_args[@]}" tools
-```
+uv run atr @hostArgs execute .atr-demo/approved.json
+~~~
 
-这组示例依次演示：
+结果为 {"sum":7}。重复提交同一批准请求返回同一 run_id。换输入、命令、版本、根任务或自行生成操作 ID 都不会取得新授权。请求模板不能直接执行；先经过宿主审批。签发、审批和凭证文件不能交给模型自主操作。
 
-1. `direct.json`：读取示例工作区的数据求和，结果为 `7`，不捕获候选。
-2. `observe.json`：执行新独立程序，结果为 `7`，保存 Candidate。
-3. `observe-repeat.json`：在另一根任务中使用相同程序，结果为 `18`，触发候选注册、Review 和工具复用。
-4. `tool.execute.json`：通过固定 `tool_id=project.sum` 调用已注册工具，结果为 `18`。
+## 创建并复用工具
 
-执行结果包含 `run_id`、状态、输出片段和 Artifact 引用。对有副作用的业务操作，应保持稳定的 `root_task_id` 和 `operation_id`；同一标识的重复请求返回已有运行。
+Manifest checks 只是建议；以下独立案例从操作者持有文件读取，不从程序自动复制。
 
-### 3. 创建并运行复合工具
+~~~powershell
+uv run atr @atrArgs approve-program examples/sum.program.json --acceptance examples/sum.acceptance.json
+uv run atr @hostArgs create examples/sum.create.json
+uv run atr @hostArgs review project.sum --version v1
+uv run atr @hostArgs approve-operation examples/tool.execute.json --business-key sum-18 --acceptance examples/tool.acceptance.json |
+  Set-Content -Encoding utf8NoBOM .atr-demo/tool-approved.json
+uv run atr @hostArgs execute .atr-demo/tool-approved.json
+~~~
 
-沿用上面的 PowerShell 参数：
+结果为 {"sum":18}。工作流文件 workflow.program.json、workflow.create.json、workflow.acceptance.json、workflow.execute.json 和 workflow-operation.acceptance.json 采用同样的批准、创建、Review、批准操作、执行顺序，先注册其依赖 project.sum@v1。
 
-```powershell
-uv run atr @atrArgs create examples/workflow.create.json
-uv run atr @atrArgs review project.numeric-analysis
-uv run atr @atrArgs execute examples/workflow.execute.json
-```
+Candidate 捕获与检索继续保留。0.2 的目标由宿主许可固定，检索结果不会自动替换批准请求，也不会自行执行新工具 Review。
 
-Bash / Zsh 中将 `@atrArgs` 替换为 `"${atr_args[@]}"`。复合工具固定依赖 `project.sum@v1`，输出为：
+## Python 与 Agent 接入
 
-```json
-{"first_total":{"sum":5},"second_total":{"sum":6}}
-```
+宿主通过 Python 对象绑定凭证，凭证不进入模型参数：
 
-步骤参数支持 `{"$input":"first"}` 和 `{"$step":"previous_step.result"}`。上层工具必须声明子工具需要的权限和副作用。
-
-## Agent 接入
-
-### JSONL 协议
-
-```powershell
-uv run atr definitions
-uv run atr @atrArgs serve
-```
-
-`serve` 每行接收一个 JSON 对象，每行返回一个带请求 ID 的响应。完整接口定义见 [interfaces.json](atr/schemas/interfaces.json)。例如检索一个兼容工具：
-
-```json
-{"id":"lookup-1","name":"read","arguments":{"operation":"registry_search","arguments":{"query":"sum","inputs":{"numbers":[1,2]}}}}
-```
-
-调用已注册工具：
-
-```json
-{"id":"run-1","name":"execute","arguments":{"root_task_id":"agent-task-1","mode":"tool","tool_id":"project.sum","inputs":{"numbers":[1,2]}}}
-```
-
-后台执行设置 `background=true`，并保持 `serve` 进程运行；随后用 `read(operation=run)` 查询状态，用 `execute(action=cancel)` 取消。
-
-### Python API
-
-```python
+~~~python
 from pathlib import Path
-
+from atr.agent_adapter import AgentAdapter
+from atr.control.authority import BehaviorRule, ResourceScope
+from atr.models import Check, ExecuteRequest, Permissions
 from atr.service import Runtime
 
-with Runtime(workspace=Path("examples/workspace"), project_key="repo:demo") as runtime:
-    result = runtime.execute({
-        "root_task_id": "task-1",
-        "argv": ["rg", "numbers", "input.json"],
-        "permissions": {"file_read": ["workspace"]},
-    })
-    print(result.model_dump(mode="json"))
-```
+with Runtime(workspace=Path("examples/workspace"), project_key="repo:demo") as rt:
+    task = rt.control.issue_task(scope=ResourceScope(read_paths=["input.json"]))
+    request = ExecuteRequest(
+        root_task_id=task.root_task_id,
+        argv=["python", "-c", "import json; print(json.dumps({'sum':sum(json.load(open('input.json'))['numbers'])}))"],
+        permissions=Permissions(file_read=["workspace"]),
+    )
+    approved = rt.control.authorize_operation(
+        task, request, business_key="sum-input",
+        rule=BehaviorRule(checks=[Check(expected={"sum": 7})]),
+    )
+    agent = AgentAdapter(rt, context=task)
+    print(agent.call("execute", approved.model_dump(mode="json")))
+~~~
 
-## 生命周期与版本
+固定接口是 read、execute、tool_create、tool_review、tool_delete。模型 Schema 没有任务签发、授权或验收写入接口，也不要求模型填写根任务；宿主适配器注入根身份并拒绝替换。工具的注册、Review、恢复、回滚、归档与删除分别需要任务 tool_actions 授权。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Candidate: 成功执行的新独立程序
-    Candidate --> Temporary: 重复需求命中并注册
-    Temporary --> Persistent: 有效调用达到阈值且 Review 通过
-    Temporary --> Archived: 固定观察期到期未达标
-    Persistent --> Dormant: 长期无有效使用
-    Dormant --> Persistent: 重新验证通过
-    Archived --> Temporary: 恢复并重新验证
-    Archived --> Deleted: 保留期结束且无受保护引用
-```
+~~~powershell
+uv run atr definitions
+uv run atr @hostArgs serve
+~~~
 
-默认参数均可配置：候选保留14天，临时观察期14天；至少5次有效调用、覆盖2个根任务，或满足同任务10个不同输入的例外，才能晋升。失败、重试、缓存和重复记账不计入晋升。归档保留30天，持久工具90天闲置后休眠。
+JSONL 服务每行发送 {"id":1,"name":"execute","arguments":{...已批准请求...}}。后台执行设置 background=true，通过 read 查询运行或 execute 的 cancel action 取消。Agent 只能读取或取消自己任务的运行与 Artifact。
 
-新版本通过 `tool_create(base_version=...)` 提出，通过 Review 后才能切换。运行中发现输出契约失败会隔离该版，并选择可用旧版；当前失败操作不会自动重放。操作者也可以显式回滚：
+## 路径、验收与费用
 
-```powershell
-uv run atr @atrArgs review project.sum --action rollback --version v1
-```
+ResourceScope.read_paths 支持精确文件或以 / 结尾的目录子树；write_paths 逐个指定文件的 create/update/delete，没有通配写权限。它们与全局 Policy 取交集，敏感路径、控制目录和符号链接继续排除。
 
-运行接收时即固定版本，排队期间版本切换不会改变已接受的运行。工作流继承重试、缓存及剩余超时，Direct 工作流也校验依赖权限；根任务的工作区修改在完整执行与契约通过后才提交。外部写入候选需要显式 Review，失败修复受任务额度限制。
+BehaviorRule.checks 检查完整输出或 expected_path，支持 JSON/文本。expected_changes 指定完整文件变更及期望 UTF-8 内容，删除用 null；额外、缺失或错误内容拒绝提交。二进制交付使用 Artifact，当前可信文件效果规则只支持 UTF-8 文件。
 
-## Research、费用和管理
+代理输入也被操作许可固定，包括接收者、URL 或传出内容。主机白名单不能代替操作者对数据与用途的判断。外部服务已经发生的副作用不能由本地验收撤销。
 
-[Research 创建示例](examples/research.create.json) 演示带来源和时间的 HTTPS 文档获取。当前示例配置只允许 `www.sqlite.org`。模型适配器的 Endpoint、模型、凭证环境变量和预算由操作者配置，详见 [适配器配置](docs/runtime.md#research-和模型适配器)。
+工作流必须在根 BehaviorRule.adapter_calls 中显式列出代理能力、完整输入和次数，前序输出不能自行扩大外传范围。配置模型路由时，还需宿主用 authorize_route/approve-route 绑定具体文本；本地规则检索不发送文本。
 
-费用报告区分输入/输出/缓存 Token、已知金额、估计金额、未知费用和待结算预算。宿主 Agent 的模型费用可通过 `record-cost` 提交；实际供应商凭证通过 `settle-cost` 结算。
+费用在调用前原子核对任务和全局上限。未知/估计账单保持预留，日志过期与重启不会补回已耗额度。max_total_cost 默认50美元，重开配置不会自动提高已存上限；操作者可显式用 set-total-budget AMOUNT 调整。cost 报告 Token、金额与预留，record-cost 和 settle-cost 接收真实宿主账单。
 
-| 命令 | 用途 |
+## 管理与开发
+
+| 操作者命令 | 用途 |
 |---|---|
-| `status` / `tools` / `runs` | 查看运行时、工具和运行记录 |
-| `search QUERY` | 检索工具和候选 |
-| `read OPERATION ARGS.json` | 读取工作区片段、源码、Manifest 或 Artifact |
-| `cost --task TASK_ID` / `metrics` | 查看任务费用与聚合指标 |
-| `events --export events.jsonl` | 导出脱敏事件 |
-| `cancel RUN_ID` | 请求取消运行及其子运行 |
-| `maintenance` | 执行一次到期、晋升和清理维护 |
-| `clear-candidates` | 清空候选池 |
-| `disable` | 暂停创建、关闭动态执行并取消动态运行 |
-| `switch auto_create on` / `switch dynamic_execute on` | 分别恢复创建或动态执行 |
+| issue-task / approve-operation / approve-program | 签发身份、操作和独立验收 |
+| revoke-task / revoke-operation / revoke-program | 撤销后续执行和未发布的本地变更 |
+| status / tools / runs / search | 状态与检索 |
+| cost / metrics / events --export | 费用、指标及显式事件导出 |
+| maintenance / disable / switch | 生命周期、暂停和取消 |
+| recover RUN_ID | 原进程停止后标记效果不确定、释放写锁，保持原操作不重放 |
 
-## 项目结构
-
-```text
-atr/
-  agent_adapter.py      # 固定五接口和协议封装
-  service.py            # 统一调度、Review、取消及管理入口
-  router.py             # 规则检索与可选模型路由
-  control/              # Registry、依赖、生命周期
-  runtime/              # Docker 沙盒与持久取消通知
-  adapters.py           # Research / 模型代理
-  accounting.py         # 费用、预算预留与结算
-  models.py             # 数据契约
-  storage.py            # SQLite 与内容寻址对象
-  schemas/              # 可分发 JSON Schema
-  evals.py              # 观察记录与配对报告接口
-  cli.py                # 命令行
-examples/               # Direct、Candidate、Tool、Workflow、Research 请求
-tests/                  # 功能契约与可选 Docker 边界用例
-docs/                   # 设计、运行说明与实施记录
-openspec/               # 规格和实施任务
-```
-
-## 开发与验证
-
-开发工具随 `uv sync` 安装。可分别运行以下检查；应根据当前改动选择需要的检查范围。
-
-```powershell
+~~~powershell
 uv run ruff check atr tests scripts
 uv run mypy atr
 uv run python scripts/export_schemas.py
 uv build
-```
+~~~
 
-初版实现的验证记录为 **42 个功能用例通过**，Ruff、mypy、Schema 生成和打包通过，详见 [2026-10-15 实施记录](docs/implementation.md)。该结果是当次记录，不表示每次文档更新都会重新执行整套测试。
+本次行为命令和实际结果见[安全修复与证据](docs/security-hardening.md)。历史42项、23项及4项用例有各自时间和范围，不能当作0.2.0的当前验证。未运行成本收益实验、付费模型调用或真实供应商账单验收。
 
-2026-10-22 补齐的 **23个行为用例与4个真实 Docker 用例通过**，完成22项设计和17项行为逐条核对，见 [当前核对记录](docs/implementation-audit.md)。真实容器验证使用单独标记的 Python 镜像；正式沙盒镜像的 Debian 依赖下载停滞，完整镜像构建尚未取得成功结果。
-
-测试目录提供执行器和网络适配器替身，用于验证控制层行为。准备好正式镜像后，可显式运行原有隔离用例和新增工作区用例：
-
-```powershell
-$env:ATR_TEST_DOCKER = '1'
-uv run pytest tests/test_docker.py -q
-uv run pytest tests/test_workspace_docker.py -q
-```
-
-执行失败与业务验证结果分开记录。镜像未准备好时返回 `sandbox_unavailable`；使用前应阅读 [运行说明](docs/runtime.md) 中的工作区授权、文件过滤、宿主适配器和资源限制。
-
-## 项目状态与文档
-
-当前版本为 **0.1.0**，已经实现运行时、控制平面、适配器、CLI 和评测记录接口。成本收益实验及“Token 降低15%”目标尚未验证。`eval-report` 用于分析已经采集的观察记录，实验数据需要来自实际任务。
-
-- [计划入口](docs/plan.md) 与 [完整 v1.0 设计](docs/ATR_Agent_Adaptive_Tool_System_Plan_v1.md)
-- [运行、权限和接入说明](docs/runtime.md)
-- [实现与验证记录](docs/implementation.md)
-- [22项 TODO 与17项行为逐项核对](docs/implementation-audit.md)
-- [OpenSpec 实施任务](openspec/changes/implement-atr-runtime/tasks.md)
+- [运行、授权与迁移](docs/runtime.md)
+- [安全控制、六项修复及证据](docs/security-hardening.md)
+- [设计计划](docs/plan.md) 与 [OpenSpec 任务](openspec/changes/implement-atr-runtime/tasks.md)
 - [固定五接口 Schema](atr/schemas/interfaces.json)

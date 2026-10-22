@@ -6,6 +6,7 @@ __pycache__/
 dist/
 *.egg-info/
 .atr/
+.atr-demo/
 .env
 .env.*
 !.env.example

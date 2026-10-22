@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AdapterGrant": {
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "minLength": 1,
+          "title": "Capability",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": true,
+          "title": "Inputs",
+          "type": "object"
+        },
+        "max_calls": {
+          "default": 1,
+          "maximum": 128,
+          "minimum": 1,
+          "title": "Max Calls",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capability",
+        "inputs"
+      ],
+      "title": "AdapterGrant",
+      "type": "object"
+    },
+    "BehaviorRule": {
+      "additionalProperties": false,
+      "properties": {
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/Check"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Checks",
+          "type": "array"
+        },
+        "output_format": {
+          "default": "json",
+          "enum": [
+            "json",
+            "text"
+          ],
+          "title": "Output Format",
+          "type": "string"
+        },
+        "expected_changes": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Expected Changes",
+          "type": "object"
+        },
+        "adapter_calls": {
+          "items": {
+            "$ref": "#/$defs/AdapterGrant"
+          },
+          "maxItems": 64,
+          "title": "Adapter Calls",
+          "type": "array"
+        }
+      },
+      "required": [
+        "checks"
+      ],
+      "title": "BehaviorRule",
+      "type": "object"
+    },
+    "Check": {
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "additionalProperties": true,
+          "title": "Inputs",
+          "type": "object"
+        },
+        "expected": {
+          "title": "Expected"
+        },
+        "name": {
+          "default": "contract",
+          "title": "Name",
+          "type": "string"
+        },
+        "expected_path": {
+          "default": "",
+          "title": "Expected Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected"
+      ],
+      "title": "Check",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "inputs": {
+      "additionalProperties": true,
+      "title": "Inputs",
+      "type": "object"
+    },
+    "rule": {
+      "$ref": "#/$defs/BehaviorRule"
+    },
+    "name": {
+      "default": "host acceptance",
+      "title": "Name",
+      "type": "string"
+    }
+  },
+  "required": [
+    "rule"
+  ],
+  "title": "TrustedCase",
+  "type": "object"
+}

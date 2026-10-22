@@ -496,6 +496,18 @@
       "default": false,
       "title": "Background",
       "type": "boolean"
+    },
+    "execution_environment": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Execution Environment"
     }
   },
   "required": [

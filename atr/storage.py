@@ -39,9 +39,17 @@ class Redactor:
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, dict):
-            return {str(k): ("[REDACTED]" if v is not None and re.search(
-                r"(?i)(password|api[_-]?key|secret|authorization|access_token)", str(k))
-                else self.data(v)) for k, v in value.items()}
+            result: dict[str, Any] = {}
+            for key, child in value.items():
+                name = self.text(str(key))
+                unique, suffix = name, 1
+                while unique in result:
+                    suffix += 1
+                    unique = f"{name}#{suffix}"
+                result[unique] = ("[REDACTED]" if child is not None and re.search(
+                    r"(?i)(password|api[_-]?key|secret|authorization|access_token)", str(key))
+                    else self.data(child))
+            return result
         if isinstance(value, list):
             return [self.data(x) for x in value]
         return value
@@ -62,7 +70,7 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=30000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3, 4):
             self.db.close()
             raise ATRError("schema_version", "unsupported metadata schema version")
         if version == 1:
@@ -117,8 +125,35 @@ class Store:
           id TEXT PRIMARY KEY, task TEXT NOT NULL, maximum REAL NOT NULL,
           run_id TEXT, state TEXT NOT NULL DEFAULT 'pending');
         CREATE TABLE IF NOT EXISTS project_locks (project TEXT PRIMARY KEY, run_id TEXT NOT NULL);
-        PRAGMA user_version=2;
+        CREATE TABLE IF NOT EXISTS task_authority (
+          id TEXT PRIMARY KEY, credential TEXT NOT NULL, scope TEXT NOT NULL,
+          expires REAL NOT NULL, max_calls INTEGER NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
+          cost_limit REAL NOT NULL, max_creations INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS operation_authority (
+          id TEXT PRIMARY KEY, task TEXT NOT NULL, business_key TEXT NOT NULL,
+          payload TEXT NOT NULL, rule TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(task,business_key));
+        CREATE TABLE IF NOT EXISTS trusted_acceptance (
+          program TEXT PRIMARY KEY, cases TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS control_budget (id INTEGER PRIMARY KEY CHECK(id=1), maximum REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS budget_charges (
+          id TEXT PRIMARY KEY, task TEXT NOT NULL, amount REAL NOT NULL, identity TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS adapter_uses (
+          root_run TEXT NOT NULL, grant_index INTEGER NOT NULL, uses INTEGER NOT NULL,
+          PRIMARY KEY(root_run,grant_index));
+        CREATE TABLE IF NOT EXISTS route_results (operation TEXT PRIMARY KEY, result TEXT NOT NULL);
+        PRAGMA user_version=4;
         """)
+        # Retained historical receipts initialize budget tombstones once. These
+        # counters are control metadata and never expire with diagnostic logs.
+        with self.transaction() as db:
+            for row in db.execute("SELECT c.* FROM costs c LEFT JOIN budget_charges b ON c.id=b.id "
+                                  "WHERE b.id IS NULL").fetchall():
+                identity = digest(canonical({"task": row["task"], "run_id": row["run_id"],
+                                             "data": json.loads(row["data"])}))
+                amount = (row["amount"] or 0) if row["currency"] == "USD" else 0
+                db.execute("INSERT INTO budget_charges VALUES (?,?,?,?)",
+                           (row["id"], row["task"], amount, identity))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -206,6 +241,7 @@ class Store:
             content = stream.read(limit)
         return {"ref": ref, "offset": offset, "next_offset": offset + len(content),
                 "total_bytes": row["size"], "text": content.decode("utf-8", errors="replace"),
+                "trust": "untrusted",
                 "truncated": offset + len(content) < row["size"]}
 
     def emit(self, kind: str, now: datetime, *, task: str | None = None,

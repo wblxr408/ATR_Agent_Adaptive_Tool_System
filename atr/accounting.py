@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime
@@ -9,7 +10,7 @@ from uuid import uuid4
 
 from atr.errors import ATRError
 from atr.models import Cost, canonical
-from atr.storage import Store
+from atr.storage import Store, digest
 
 
 class Ledger:
@@ -17,16 +18,26 @@ class Ledger:
         self.store, self.clock, self.budget = store, clock, budget
 
     def reserve(self, task: str, maximum: float, run_id: str | None = None) -> str:
-        if maximum < 0:
+        if not math.isfinite(maximum) or maximum < 0:
             raise ATRError("invalid_budget", "cost bound cannot be negative")
         reservation = uuid4().hex
         with self.store.transaction() as db:
+            authority = db.execute("SELECT cost_limit,expires,revoked FROM task_authority WHERE id=?", (task,)).fetchone()
+            if not authority:
+                raise ATRError("task_authority", "budget requires an issued root task")
+            if authority["revoked"] or self.clock().timestamp() >= authority["expires"]:
+                raise ATRError("task_expired", "task cannot acquire another reservation")
             db.execute("INSERT OR IGNORE INTO task_budget(task) VALUES (?)", (task,))
             row = db.execute("SELECT reserved FROM task_budget WHERE task=?", (task,)).fetchone()
-            amount = db.execute("SELECT COALESCE(SUM(amount),0) FROM costs WHERE task=? "
-                                "AND currency='USD'", (task,)).fetchone()[0]
-            if amount + row["reserved"] + maximum > self.budget:
+            amount = db.execute("SELECT COALESCE(SUM(amount),0) FROM budget_charges WHERE task=?",
+                                (task,)).fetchone()[0]
+            if amount + row["reserved"] + maximum > min(self.budget, authority["cost_limit"]):
                 raise ATRError("cost_budget", "task cost budget would be exceeded")
+            global_limit = db.execute("SELECT maximum FROM control_budget WHERE id=1").fetchone()[0]
+            global_amount = db.execute("SELECT COALESCE(SUM(amount),0) FROM budget_charges").fetchone()[0]
+            global_reserved = db.execute("SELECT COALESCE(SUM(maximum),0) FROM reservations WHERE state!='settled'").fetchone()[0]
+            if global_amount + global_reserved + maximum > global_limit:
+                raise ATRError("total_cost_budget", "persistent total cost budget would be exceeded")
             db.execute("UPDATE task_budget SET reserved=reserved+? WHERE task=?", (maximum, task))
             db.execute("INSERT INTO reservations(id,task,maximum,run_id) VALUES (?,?,?,?)",
                        (reservation, task, maximum, run_id))
@@ -44,7 +55,14 @@ class Ledger:
 
     def record(self, task: str, cost: Cost, run_id: str | None = None,
                *, entry_id: str | None = None) -> None:
+        entry_id = entry_id or uuid4().hex
+        identity = digest(canonical({"task": task, "run_id": run_id, "data": cost.model_dump(mode="json")}))
         with self.store.transaction() as db:
+            tombstone = db.execute("SELECT identity FROM budget_charges WHERE id=?", (entry_id,)).fetchone()
+            if tombstone:
+                if tombstone[0] != identity:
+                    raise ATRError("receipt_conflict", "receipt identity is bound to another billing payload")
+                return
             if entry_id:
                 existing = db.execute("SELECT task,run_id,data FROM costs WHERE id=?", (entry_id,)).fetchone()
                 if existing:
@@ -52,8 +70,10 @@ class Ledger:
                         raise ATRError("receipt_conflict", "receipt identity is bound to another billing payload")
                     return
             db.execute("INSERT INTO costs VALUES (?,?,?,?,?,?,?,?)", (
-                entry_id or uuid4().hex, task, run_id, self.clock().timestamp(), cost.category,
+                entry_id, task, run_id, self.clock().timestamp(), cost.category,
                 cost.currency, cost.amount, canonical(cost)))
+            db.execute("INSERT INTO budget_charges VALUES (?,?,?,?)", (entry_id, task,
+                (cost.amount or 0) if cost.currency == "USD" else 0, identity))
         self.store.emit("cost_recorded", self.clock(), task=task, run_id=run_id,
                         category=cost.category, amount=cost.amount, currency=cost.currency)
 
@@ -112,6 +132,11 @@ class Ledger:
             db.execute("INSERT INTO costs VALUES (?,?,?,?,?,?,?,?)", (
                 reservation + ":settled", held["task"], held["run_id"], self.clock().timestamp(),
                 receipt.category, receipt.currency, receipt.amount, canonical(receipt)))
+            db.execute("UPDATE budget_charges SET amount=0 WHERE id GLOB ?", (reservation + ":*",))
+            identity = digest(canonical({"task": held["task"], "run_id": held["run_id"],
+                                        "data": receipt.model_dump(mode="json")}))
+            db.execute("INSERT INTO budget_charges VALUES (?,?,?,?)", (
+                reservation + ":settled", held["task"], receipt.amount, identity))
             db.execute("UPDATE task_budget SET reserved=MAX(0,reserved-?) WHERE task=?",
                        (held["maximum"], held["task"]))
             db.execute("UPDATE reservations SET state='settled' WHERE id=?", (reservation,))

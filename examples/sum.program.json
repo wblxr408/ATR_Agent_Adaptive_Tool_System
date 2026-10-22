@@ -1,0 +1,64 @@
+{
+  "manifest": {
+    "id": "project.sum",
+    "project_key": "repo:demo",
+    "description": "Sum numeric inputs",
+    "tags": [
+      "numbers",
+      "sum"
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "numbers": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        }
+      },
+      "required": [
+        "numbers"
+      ],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "sum": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "sum"
+      ],
+      "additionalProperties": false
+    },
+    "checks": [
+      {
+        "name": "negative-and-positive",
+        "inputs": {
+          "numbers": [
+            3,
+            -1
+          ]
+        },
+        "expected": {
+          "sum": 2
+        }
+      },
+      {
+        "name": "empty-input",
+        "inputs": {
+          "numbers": []
+        },
+        "expected": {
+          "sum": 0
+        }
+      }
+    ]
+  },
+  "files": {
+    "main.py": "import json,sys\nx=json.load(sys.stdin)\nprint(json.dumps({'sum':sum(x['numbers'])}))\n"
+  }
+}
