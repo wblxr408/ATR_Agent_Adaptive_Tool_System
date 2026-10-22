@@ -2,7 +2,14 @@
 
 ATR 是单用户、本地部署的 Agent 工具运行时，提供受控执行、工具注册与复用、固定版本工作流、生命周期管理和费用记录。
 
-**0.2.0 将调用 Agent 本身也视为不可信。** 宿主签发任务身份、预算和操作许可；Agent 通过固定五接口提交已获准请求。生成程序在 Docker 中运行，网络与模型访问通过宿主配置的代理。
+**0.3.0 可直接接入 Codex 和 Claude Code，无需镜像。** MCP 复用已受信的 JSON/CSV/文本工具，hook 只在匹配时提示。未知生成代码仍需独立审批；本机执行限操作者受信程序，隔离执行可选原有 Docker 后端。
+
+```powershell
+uv sync --locked --extra integration
+uv run --extra integration atr-native install-clients
+```
+
+安装保留并备份现有两端配置。重载 MCP/重开会话后可用；Codex 新 hook 在 `/hooks` 审阅信任。[接入、工具输入与扩展](docs/native-clients.md)；[理论成本收益与盈亏平衡](docs/cost-benefit.md)。重复稳定任务理论上可能受益，未测量或承诺节省比例。
 
 ## 能力与边界
 
@@ -21,7 +28,7 @@ ATR 是单用户、本地部署的 Agent 工具运行时，提供受控执行、
 
 ## 安装
 
-需要 Python 3.12+、uv 和 Linux Docker 引擎。
+本机接入需要 Python 3.12–3.14 和 uv。以下隔离执行流程另需 Linux Docker 引擎。
 
 ~~~powershell
 git clone https://github.com/wblxr408/ATR_Agent_Adaptive_Tool_System.git

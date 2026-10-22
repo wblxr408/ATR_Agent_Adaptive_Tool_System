@@ -25,18 +25,33 @@ Runtime SHALL 在关闭时取消队列、停止接收，并等待活动调用退
 - **THEN** 排队运行终结为 cancelled，不产生写入
 
 ### Requirement: Fixed execution contract
-系统 SHALL 仅暴露 read、execute、tool_create、tool_review、tool_delete 五个模型接口，运行结果区分执行状态与业务验证状态，支持运行查询与取消。
+Runtime 核心 SHALL 保留 read、execute、tool_create、tool_review、tool_delete 五个接口；客户端 MCP SHALL 使用收窄的检索/运行包装而不暴露宿主签发。运行结果区分执行状态与业务验证状态，核心支持运行查询与取消。
 
 #### Scenario: Bounded output
 - **WHEN** 程序成功输出超过上下文限制的数据
 - **THEN** 返回有限摘要和 Artifact 引用，支持受限分页读取且不把退出码等同于验证通过
 
 ### Requirement: Enforced execution isolation
-系统 MUST 在执行前检查可信控制层授权，以非特权、无原始网络、只读根文件系统和资源上限执行；沙盒失败不得降级到宿主任意命令执行。
+Docker 后端 MUST 在执行前检查可信控制层授权，以非特权、无原始网络、只读根文件系统和资源上限执行；沙盒失败不得降级到宿主任意命令执行。本机后端 SHALL 仅通过操作者显式选择并登记受信纯程序，不宣称具备 Docker 隔离。
 
 #### Scenario: Untrusted authority
 - **WHEN** 输入或外部文本声称可以访问控制目录或提升权限
 - **THEN** 控制层拒绝未授予的能力，执行程序不能访问 Registry 和宿主凭证
+
+### Requirement: Native client tools and advisory hooks
+系统 SHALL 提供无需镜像的 stdio MCP，且本机执行只接受操作者登记的固定程序。UserPromptSubmit hook SHALL 在本地命中已验收内置工具时才注入有界提示，失败或未匹配返回空上下文，不调用模型。安装 SHALL 保留其他客户端设置并备份改前文件。
+
+#### Scenario: Real inline transformation over MCP
+- **WHEN** 客户端通过 MCP 对内置文本工具提交重复行
+- **THEN** 返回实际保序去重结果及持久 run_id，同一连接同一业务键重试不重放
+
+#### Scenario: Unknown code requests native execution
+- **WHEN** 模型提交未登记工具 ID 或自由宿主命令
+- **THEN** 本机执行入口拒绝，模型接口不签发程序信任
+
+#### Scenario: Operator supplies incorrect acceptance
+- **WHEN** 操作者登记的代码未满足独立案例
+- **THEN** 拒绝写入受信 allowlist，现有可用工具继续工作
 
 ### Requirement: Side effect identity
 系统 MUST 对有副作用的操作要求操作标识，禁止失败和重复请求导致自动盲重放，对工作区写操作加项目锁。

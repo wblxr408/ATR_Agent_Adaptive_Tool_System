@@ -1,0 +1,8 @@
+{
+  "program": {
+    "manifest": {"id": "custom.sum10", "scope": "global", "description": "Sum inline numbers whose accepted total is ten"},
+    "files": {"main.py": "import json,sys\nx=json.load(sys.stdin)\njson.dump({'sum':sum(x['numbers'])},sys.stdout)"}
+  },
+  "cases": [{"inputs": {"numbers": [4,6]}, "rule": {"checks": [{"expected": {"sum": 10}}]}}],
+  "call_rule": {"checks": [{"expected_path": "sum", "expected": 10}]}
+}
