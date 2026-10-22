@@ -226,6 +226,13 @@ class DockerSandbox:
     @classmethod
     def _commit(cls, staged: Path, workspace: Path, policy: Policy, maximum: int,
                 baseline: dict[str, bytes]) -> dict[str, object]:
+        targets, changes = cls._plan_commit(staged, workspace, policy, maximum, baseline)
+        cls._apply_commit(targets)
+        return changes
+
+    @classmethod
+    def _plan_commit(cls, staged: Path, workspace: Path, policy: Policy, maximum: int,
+                     baseline: dict[str, bytes]) -> tuple[list[tuple[Path, bytes | None]], dict[str, object]]:
         files = cls._collect(staged, maximum)
         targets: list[tuple[Path, bytes | None]] = []
         diffs: list[str] = []
@@ -250,6 +257,11 @@ class DockerSandbox:
                     (content or b"").decode("utf-8", errors="replace").splitlines(keepends=True),
                     fromfile="a/" + name, tofile="b/" + name))
                 diffs.append(diff[:65536])
+        return targets, {"changed_paths": changed, "diff": "\n".join(diffs)[:262144],
+                         "diff_truncated": sum(len(d) for d in diffs) > 262144}
+
+    @staticmethod
+    def _apply_commit(targets: list[tuple[Path, bytes | None]]) -> None:
         for target, content in targets:
             if content is None:
                 target.unlink()
@@ -263,5 +275,3 @@ class DockerSandbox:
             finally:
                 if os.path.isfile(name):
                     os.unlink(name)
-        return {"changed_paths": changed, "diff": "\n".join(diffs)[:262144],
-                "diff_truncated": sum(len(d) for d in diffs) > 262144}

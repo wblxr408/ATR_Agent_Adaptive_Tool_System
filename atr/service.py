@@ -128,13 +128,21 @@ class Runtime:
                 previous = db.execute("SELECT * FROM runs WHERE id=?", (request.retry_of,)).fetchone()
                 if not previous or previous["task"] != request.root_task_id:
                     raise ATRError("invalid_retry", "retry target must belong to the same root task")
+            bound_id, bound_version, epoch = request.tool_id, request.version, 0
+            if request.mode == "tool":
+                assert request.tool_id
+                _, accepted = self.registry.program(request.tool_id, request.version)
+                bound_version, epoch = accepted["version"], accepted["epoch"]
+                result.version = bound_version
+            elif review and request.program:
+                bound_id, bound_version = request.program.manifest.id, request.program.manifest.version
             db.execute("""INSERT INTO runs
                 (id,task,operation,payload,tool_id,version,parent,input_key,retry_of,
-                 cache_hit,review_run,started,result,dynamic) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                 cache_hit,review_run,started,result,dynamic,epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     run_id, request.root_task_id, request.operation_id, payload,
-                    request.tool_id, request.version, parent, digest(canonical(request.inputs)),
+                    bound_id, bound_version, parent, digest(canonical(request.inputs)),
                     request.retry_of, int(request.cache_hit), int(review), now.timestamp(), canonical(result),
-                    int(request.mode == "tool" or request.program is not None)))
+                    int(request.mode == "tool" or request.program is not None), epoch))
             new_task = db.execute("INSERT OR IGNORE INTO tasks VALUES (?,?)", (request.root_task_id, now.timestamp())).rowcount
         if new_task:
             self.store.emit("task_started", now, task=request.root_task_id)
@@ -190,8 +198,10 @@ class Runtime:
         acquired = project_locked = False
         program: Program | None = None
         row: dict[str, Any] | None = None
-        review_area: tempfile.TemporaryDirectory[str] | None = None
+        workspace_area: tempfile.TemporaryDirectory[str] | None = None
+        workspace_baseline: dict[str, bytes] = {}
         execution_workspace = workspace_override or self.workspace
+        original_workspace = execution_workspace
         try:
             if depth > 16:
                 raise ATRError("dependency_depth", "maximum workflow depth exceeded")
@@ -202,12 +212,23 @@ class Runtime:
             preview = supplied_program or request.program
             if request.mode == "tool":
                 assert request.tool_id
+                accepted_run = self.store.one("SELECT version FROM runs WHERE id=?", (run_id,))
+                if accepted_run and accepted_run["version"]:
+                    request = request.model_copy(update={"version": accepted_run["version"]})
+                assert request.tool_id
                 preview, _ = self.registry.program(request.tool_id, request.version)
             if preview is None or preview.manifest.kind == "script":
                 self._refresh_environment(required=True)
             if request.program:
                 request = request.model_copy(update={"program": self._bind_program(request.program)})
             if not review and request.mode == "direct":
+                # Registration may execute contract cases. Check the actual business
+                # request before any such work or provider call can occur.
+                if request.program:
+                    proposed = request.program.manifest
+                    self.policy.validate_manifest(proposed, self.project_key, self.environment)
+                    Draft202012Validator(proposed.input_schema).validate(request.inputs)
+                    self._check_effect_identity(request, proposed.side_effect)
                 request = self._reuse_or_observe(request)
                 result.mode = request.mode
             if not parent:
@@ -218,7 +239,10 @@ class Runtime:
                 program = supplied_program
             elif request.mode == "tool":
                 assert request.tool_id
-                program, row = self.registry.program(request.tool_id, request.version)
+                with self.store.transaction() as db:
+                    program, row = self.registry.program(request.tool_id, request.version)
+                    db.execute("UPDATE runs SET tool_id=?,version=?,epoch=? WHERE id=?",
+                               (row["id"], row["version"], row["epoch"], run_id))
                 if row["state"] in RESTRICTED or (row["state"] not in ACTIVE and not parent) or not row["reviewed"]:
                     raise ATRError("review_required", "inactive or unreviewed tool requires review")
                 review_environment = json.loads(row["review"]).get("environment") if row["review"] else None
@@ -238,6 +262,7 @@ class Runtime:
             side_effect = manifest.side_effect if manifest else request.side_effect
             if manifest:
                 self.policy.validate_manifest(manifest, self.project_key, self.environment)
+                self.registry._dependencies(manifest)
                 Draft202012Validator(manifest.input_schema).validate(request.inputs)
                 result.tool_id, result.version = manifest.id, manifest.version
                 with self.store.transaction() as db:
@@ -246,22 +271,19 @@ class Runtime:
                                 row["epoch"] if row else 0, run_id))
             else:
                 self.policy.authorize(permissions, side_effect, limits)
-            if side_effect in ("workspace_write", "external_write") and not request.operation_id:
-                raise ATRError("operation_required", "side effects require operation_id")
-            if request.retry_of and side_effect in ("workspace_write", "external_write"):
-                raise ATRError("unsafe_retry", "side effects cannot be replayed as an automatic retry")
+            self._check_effect_identity(request, side_effect)
             if review and side_effect == "external_write" and not self.policy.allow_external_review:
                 raise ATRError("external_review_denied", "external side-effect review requires a distinct operator grant")
-            if review and not parent and side_effect == "workspace_write":
-                review_area = tempfile.TemporaryDirectory(prefix="atr-review-")
-                execution_workspace = Path(review_area.name)
-                snapshot(self.workspace, execution_workspace, self.policy, self.settings.max_workspace_bytes)
-            if side_effect == "workspace_write" and not parent:
+            if "workspace" in permissions.file_write and not parent:
                 with self.store.transaction() as db:
                     if db.execute("SELECT 1 FROM project_locks WHERE project=?", (self.project_key,)).fetchone():
                         raise ATRError("workspace_busy", "another execution owns the project write lock")
                     db.execute("INSERT INTO project_locks VALUES (?,?)", (self.project_key, run_id))
                 project_locked = True
+                workspace_area = tempfile.TemporaryDirectory(prefix="atr-workspace-")
+                execution_workspace = Path(workspace_area.name)
+                snapshot(original_workspace, execution_workspace, self.policy, self.settings.max_workspace_bytes)
+                workspace_baseline = DockerSandbox._collect(execution_workspace, self.settings.max_workspace_bytes)
             if flag.is_set():
                 raise ATRError("cancelled", "execution cancelled")
             if manifest and manifest.kind == "workflow":
@@ -269,7 +291,7 @@ class Runtime:
                 output = self._workflow(program, request, run_id, flag, depth, review, execution_workspace, deadline)
                 outcome = SandboxOutcome("succeeded", 0, canonical(output).encode())
             elif manifest and manifest.kind in ("adapter", "model_pipeline"):
-                output = self._adapter(program, request, run_id, flag)
+                output = self._adapter(program, request, run_id, flag, deadline)
                 outcome = SandboxOutcome("succeeded", 0, canonical(output).encode())
             else:
                 argv = manifest.entrypoint if manifest else request.argv
@@ -290,6 +312,29 @@ class Runtime:
                 raise ATRError("artifact_limit", "run artifacts exceed configured byte budget")
             result.status, result.exit_code = outcome.status, outcome.exit_code
             result.error_code, result.truncated = outcome.error_code, outcome.truncated
+            if outcome.status == "succeeded" and manifest and manifest.output_schema:
+                try:
+                    Draft202012Validator(manifest.output_schema).validate(json.loads(outcome.stdout))
+                    result.validation_status = "passed"
+                except (ValidationError, ValueError, UnicodeError):
+                    result.validation_status, result.status = "failed", "failed"
+                    result.error_code = "output_contract"
+            if workspace_area:
+                # A child may have committed to the root's staging directory. Only
+                # the fully validated root may publish changes to the user project.
+                outcome.files.pop("workspace_changes.json", None)
+                if result.status == "succeeded" and not review:
+                    targets, changes = DockerSandbox._plan_commit(
+                        execution_workspace, original_workspace, self.policy,
+                        self.settings.max_workspace_bytes, workspace_baseline)
+                    outcome.files["workspace_changes.json"] = canonical(changes).encode()
+                    if sum(len(v) for v in outcome.files.values()) > limits.artifact_bytes:
+                        raise ATRError("artifact_limit", "workspace change report exceeds artifact budget")
+                    if flag.is_set():
+                        raise ATRError("cancelled", "execution cancelled before workspace publication")
+                    if time.monotonic() > deadline:
+                        raise ATRError("timed_out", "execution deadline exceeded before workspace publication")
+                    DockerSandbox._apply_commit(targets)
             stdout = self.redactor.text(outcome.stdout.decode("utf-8", errors="replace"))
             result.stdout_excerpt = stdout[:self.settings.excerpt_chars]
             result.truncated |= len(stdout) > self.settings.excerpt_chars
@@ -299,13 +344,6 @@ class Runtime:
                 result.artifacts.append(self.store.artifact(run_id, "stderr", outcome.stderr, self.clock()))
             for name, content in outcome.files.items():
                 result.artifacts.append(self.store.artifact(run_id, name, content, self.clock()))
-            if outcome.status == "succeeded" and manifest and manifest.output_schema:
-                try:
-                    Draft202012Validator(manifest.output_schema).validate(json.loads(outcome.stdout))
-                    result.validation_status = "passed"
-                except (ValidationError, ValueError, UnicodeError):
-                    result.validation_status, result.status = "failed", "failed"
-                    result.error_code = "output_contract"
             result.summary = ("execution completed; business correctness requires task-level evidence"
                               if result.status == "succeeded" else "execution did not complete successfully")
             if (request.generated_independent and result.status == "succeeded" and program
@@ -359,8 +397,8 @@ class Runtime:
                     db.execute("DELETE FROM project_locks WHERE project=? AND run_id=?", (self.project_key, run_id))
             if acquired:
                 self.slots.release()
-            if review_area:
-                review_area.cleanup()
+            if workspace_area:
+                workspace_area.cleanup()
             with self.flag_lock:
                 self.cancel_flags.pop(run_id, None)
             self.ledger.record(request.root_task_id, Cost(category="compute", amount=(
@@ -380,8 +418,16 @@ class Runtime:
             self.lifecycle.tick()
         return result
 
+    @staticmethod
+    def _check_effect_identity(request: ExecuteRequest, side_effect: str) -> None:
+        if side_effect in ("workspace_write", "external_write"):
+            if not request.operation_id:
+                raise ATRError("operation_required", "side effects require operation_id")
+            if request.retry_of:
+                raise ATRError("unsafe_retry", "side effects cannot be replayed as an automatic retry")
+
     def _adapter(self, program: Program | None, request: ExecuteRequest, run_id: str,
-                 flag: threading.Event) -> Any:
+                 flag: threading.Event, deadline: float) -> Any:
         assert program
         manifest = program.manifest
         capability = manifest.adapter
@@ -395,16 +441,19 @@ class Runtime:
         recorded = False
         complete = False
         try:
-            response = adapter.call(request.inputs, timeout=manifest.runtime.timeout_seconds,
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ATRError("timed_out", "adapter time budget exhausted")
+            response = adapter.call(request.inputs, timeout=remaining,
                                     cancel=flag, now=self.clock())
             total = 0.0
             for index, cost in enumerate(response.costs):
                 self.ledger.record(request.root_task_id, cost, run_id, entry_id=f"{reservation}:{index}")
+                recorded = True
                 if cost.currency != "USD":
                     raise ATRError("billing_currency", "budgeted adapters must report USD")
                 if cost.amount is not None:
                     total += cost.amount
-            recorded = bool(response.costs)
             complete = recorded and all(c.amount is not None and not c.estimated for c in response.costs)
             if total > maximum:
                 raise ATRError("adapter_budget", "adapter exceeded its declared maximum charge")
@@ -431,8 +480,18 @@ class Runtime:
             if signature(other) != signature(program):
                 continue
             if match["entity"] == "candidate":
-                created = self.tool_create(CreateRequest(root_task_id=request.root_task_id,
-                                                        candidate_id=match["id"]))
+                try:
+                    created = self.tool_create(CreateRequest(root_task_id=request.root_task_id,
+                                                            candidate_id=match["id"]))
+                except ATRError as exc:
+                    self.store.emit("candidate_registration_deferred", self.clock(),
+                                    task=request.root_task_id, candidate_id=match["id"], reason=exc.code)
+                    break
+                if program.manifest.side_effect == "external_write":
+                    self.store.emit("candidate_review_deferred", self.clock(), task=request.root_task_id,
+                                    tool_id=created["tool_id"], version=created["version"],
+                                    reason="external effects require an explicit review request")
+                    break
                 report = self.tool_review(created["tool_id"], created["version"], root_task_id=request.root_task_id)
                 if not isinstance(report, ReviewReport) or not report.passed:
                     # Original program is still available for a controlled Direct attempt.
@@ -484,7 +543,8 @@ class Runtime:
             child = ExecuteRequest(root_task_id=request.root_task_id, mode="tool",
                                    tool_id=step.tool_id, version=step.version,
                                    inputs=self._resolve(step.inputs, request.inputs, outputs),
-                                   operation_id=f"{run_id}:{step.name}")
+                                   operation_id=f"{run_id}:{step.name}",
+                                   retry_of=request.retry_of, cache_hit=request.cache_hit)
             child_id, previous = self._begin(child, parent=run_id, review=review)
             result = previous or self._run(child, child_id, parent=run_id, depth=depth + 1,
                 review=review, workspace_override=workspace, deadline=deadline)
@@ -603,6 +663,10 @@ class Runtime:
         now = self.clock()
         report.environment = self.environment
         with self.store.transaction() as db:
+            current = db.execute("SELECT state FROM tools WHERE id=? AND version=?",
+                                 (tool_id, manifest.version)).fetchone()
+            if not current or current["state"] == State.DELETED:
+                raise ATRError("not_found", "tool version was deleted during review")
             state = row["state"]
             restoring = state in (State.ARCHIVED, State.DORMANT, State.DISABLED, State.QUARANTINED)
             if report.passed:
@@ -629,6 +693,8 @@ class Runtime:
         return self.registry.delete(tool_id, version, purge=purge)
 
     def route(self, intent: Intent) -> Any:
+        self.lifecycle.tick()
+        self._refresh_environment()
         return self.router.route(intent)
 
     def cancel(self, run_id: str) -> Json:

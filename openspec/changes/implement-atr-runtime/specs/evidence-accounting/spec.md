@@ -20,6 +20,18 @@
 - **WHEN** 某次模型调用没有供应商账单数据
 - **THEN** 报告标记费用不完整，保留已知 Token 与费用，不宣称实际净收益
 
+#### Scenario: Pending billing retention
+- **WHEN** 普通聚合日志达到保留期，但调用尚未取得实际账单
+- **THEN** 保留该调用的费用及 Token 和预留供结算使用，报告仍显示未完成计费
+
+#### Scenario: Budget rejection before routing model
+- **WHEN** 路由预算拒绝调用或供应商凭证重复提交
+- **THEN** 未调用模型时记录零次调用，相同凭证只产生一次计费，不同内容复用同一凭证标识时拒绝
+
+#### Scenario: Structured output redaction
+- **WHEN** JSON 输出包含凭证值或 null 敏感字段
+- **THEN** 按结构脱敏并保留合法 JSON 与 null，后续工作流能够解析公开结果
+
 ### Requirement: Fair paired evaluation
 评测 SHALL 对齐任务、模型、权限、预算和冷热阶段，以质量为前提报告成本、Token、时延、检索和失败指标，不得伪造真实工作样本。
 

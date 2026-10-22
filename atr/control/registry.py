@@ -224,6 +224,13 @@ class Registry:
             used = db.execute("SELECT creations FROM task_budget WHERE task=?", (task,)).fetchone()[0]
             if used >= self.settings.max_creations_per_task:
                 raise ATRError("creation_budget", "task tool creation budget exhausted")
+            repairing = base_version is not None and db.execute(
+                "SELECT 1 FROM tools WHERE id=? AND state='quarantined'", (manifest.id,)).fetchone()
+            if repairing:
+                repairs = db.execute("SELECT repairs FROM task_budget WHERE task=?", (task,)).fetchone()[0]
+                if repairs >= self.settings.max_repairs:
+                    raise ATRError("repair_budget", "task tool repair budget exhausted")
+                db.execute("UPDATE task_budget SET repairs=repairs+1 WHERE task=?", (task,))
             db.execute("UPDATE task_budget SET creations=creations+1 WHERE task=?", (task,))
             ref = self.store.put(canonical(program).encode())
             db.execute("""INSERT INTO tools
@@ -262,13 +269,17 @@ class Registry:
         runs = self.store.rows("""SELECT * FROM runs WHERE tool_id=? AND version=?
             AND epoch=? AND review_run=0""", (tool_id, version, row["epoch"]))
         eligible = [r for r in runs if r["eligible"]]
+        inputs_by_task: dict[str, set[str]] = {}
+        for run in eligible:
+            inputs_by_task.setdefault(run["task"], set()).add(run["input_key"])
         return {"total_calls": len(runs), "eligible_uses": len(eligible),
                 "failed_calls": sum(json.loads(r["result"])["status"] in (
                     "failed", "timed_out", "cancelled") for r in runs),
                 "direct_uses": sum(not r["parent"] for r in runs),
                 "indirect_uses": sum(bool(r["parent"]) for r in runs),
                 "distinct_root_tasks": len({r["task"] for r in eligible}),
-                "distinct_inputs": len({r["input_key"] for r in eligible})}
+                "distinct_inputs": len({r["input_key"] for r in eligible}),
+                "same_task_distinct_inputs": max((len(values) for values in inputs_by_task.values()), default=0)}
 
     def delete(self, tool_id: str, version: str | None = None, *, purge: bool = False) -> dict[str, Any]:
         _, row = self.program(tool_id, version)
@@ -283,6 +294,9 @@ class Registry:
         with self.store.transaction() as db:
             if self.referenced(tool_id, version):
                 raise ATRError("dependency_protected", "version is required by an active dependency chain")
+            if db.execute("SELECT 1 FROM runs WHERE tool_id=? AND version=? AND finished IS NULL",
+                          (tool_id, version)).fetchone():
+                raise ATRError("running_reference", "version has an unfinished execution")
             db.execute("UPDATE tools SET state=?,archived=? WHERE id=? AND version=?",
                        (state, now.timestamp(), tool_id, version))
             db.execute("DELETE FROM search WHERE entity='tool' AND id=? AND version=?", (tool_id, version))

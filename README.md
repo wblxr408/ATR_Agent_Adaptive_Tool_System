@@ -182,6 +182,8 @@ stateDiagram-v2
 uv run atr @atrArgs review project.sum --action rollback --version v1
 ```
 
+运行接收时即固定版本，排队期间版本切换不会改变已接受的运行。工作流继承重试、缓存及剩余超时，Direct 工作流也校验依赖权限；根任务的工作区修改在完整执行与契约通过后才提交。外部写入候选需要显式 Review，失败修复受任务额度限制。
+
 ## Research、费用和管理
 
 [Research 创建示例](examples/research.create.json) 演示带来源和时间的 HTTPS 文档获取。当前示例配置只允许 `www.sqlite.org`。模型适配器的 Endpoint、模型、凭证环境变量和预算由操作者配置，详见 [适配器配置](docs/runtime.md#research-和模型适配器)。
@@ -236,11 +238,14 @@ uv build
 
 初版实现的验证记录为 **42 个功能用例通过**，Ruff、mypy、Schema 生成和打包通过，详见 [2026-10-15 实施记录](docs/implementation.md)。该结果是当次记录，不表示每次文档更新都会重新执行整套测试。
 
-测试目录提供执行器和网络适配器替身，用于验证控制层行为；另有4个需要 Linux Docker 镜像的真实隔离用例，初版交付时尚未执行。需要验证这些边界时可显式运行：
+2026-10-22 补齐的 **23个行为用例与4个真实 Docker 用例通过**，完成22项设计和17项行为逐条核对，见 [当前核对记录](docs/implementation-audit.md)。真实容器验证使用单独标记的 Python 镜像；正式沙盒镜像的 Debian 依赖下载停滞，完整镜像构建尚未取得成功结果。
+
+测试目录提供执行器和网络适配器替身，用于验证控制层行为。准备好正式镜像后，可显式运行原有隔离用例和新增工作区用例：
 
 ```powershell
 $env:ATR_TEST_DOCKER = '1'
 uv run pytest tests/test_docker.py -q
+uv run pytest tests/test_workspace_docker.py -q
 ```
 
 执行失败与业务验证结果分开记录。镜像未准备好时返回 `sandbox_unavailable`；使用前应阅读 [运行说明](docs/runtime.md) 中的工作区授权、文件过滤、宿主适配器和资源限制。
@@ -252,5 +257,6 @@ uv run pytest tests/test_docker.py -q
 - [计划入口](docs/plan.md) 与 [完整 v1.0 设计](docs/ATR_Agent_Adaptive_Tool_System_Plan_v1.md)
 - [运行、权限和接入说明](docs/runtime.md)
 - [实现与验证记录](docs/implementation.md)
+- [22项 TODO 与17项行为逐项核对](docs/implementation-audit.md)
 - [OpenSpec 实施任务](openspec/changes/implement-atr-runtime/tasks.md)
 - [固定五接口 Schema](atr/schemas/interfaces.json)

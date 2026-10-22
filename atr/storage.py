@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -38,7 +39,7 @@ class Redactor:
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, dict):
-            return {str(k): ("[REDACTED]" if re.search(
+            return {str(k): ("[REDACTED]" if v is not None and re.search(
                 r"(?i)(password|api[_-]?key|secret|authorization|access_token)", str(k))
                 else self.data(v)) for k, v in value.items()}
         if isinstance(value, list):
@@ -177,7 +178,17 @@ class Store:
     def artifact(self, run_id: str, name: str, content: bytes, now: datetime,
                  mime: str = "text/plain") -> Artifact:
         # The public artifact surface is text/JSON; binary output must be explicitly encoded.
-        content = self.redactor.text(content.decode("utf-8", errors="replace")).encode()
+        decoded = content.decode("utf-8", errors="replace")
+        try:
+            structured = json.loads(decoded)
+        except ValueError:
+            content = self.redactor.text(decoded).encode()
+        else:
+            # Redact values, then serialize: replacing text inside JSON can turn
+            # null/numbers or escaped credentials into an invalid document.
+            content = canonical(self.redactor.data(structured)).encode()
+            if mime == "text/plain":
+                mime = "application/json"
         with self.transaction() as db:
             ref = self.put(content)
             db.execute("INSERT OR IGNORE INTO artifacts VALUES (?,?,?,?,?,?)",

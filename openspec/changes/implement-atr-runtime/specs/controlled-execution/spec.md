@@ -26,3 +26,11 @@
 #### Scenario: Repeated operation
 - **WHEN** 同一操作标识再次提交或改变了有效载荷
 - **THEN** 相同请求返回既有运行，不同请求被拒绝，执行次数不会增加
+
+#### Scenario: Root workspace transaction boundary
+- **WHEN** 根调用或其固定依赖声明工作区写权限，随后执行或输出契约失败
+- **THEN** 整个根调用的暂存文件不提交，项目锁覆盖所有写入子调用；Review 始终使用一次性工作区
+
+#### Scenario: Candidate external effects
+- **WHEN** 重复命中有外部写入的候选，或自动创建暂停/耗尽
+- **THEN** 先检查权限、输入、操作标识和重试门禁；自动路由不执行外部写入 Review，保留受控 Direct 路径

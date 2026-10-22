@@ -33,7 +33,7 @@ class Lifecycle:
                 ordinary = (stats["eligible_uses"] >= self.settings.promotion_uses
                             and stats["distinct_root_tasks"] >= self.settings.promotion_tasks)
                 exception = (self.settings.same_task_uses is not None
-                             and stats["distinct_inputs"] >= self.settings.same_task_uses)
+                             and stats["same_task_distinct_inputs"] >= self.settings.same_task_uses)
                 if row["reviewed"] and (ordinary or exception):
                     target = State.PERSISTENT
                 elif now.timestamp() >= end:
@@ -50,6 +50,12 @@ class Lifecycle:
                     target = State.DELETED
             if target is not None:
                 with self.store.transaction() as db:
+                    if target == State.DELETED and (
+                        self.registry.referenced(tool_id, version) or db.execute(
+                            "SELECT 1 FROM runs WHERE tool_id=? AND version=? AND finished IS NULL",
+                            (tool_id, version)).fetchone()
+                    ):
+                        continue
                     updated = db.execute("UPDATE tools SET state=?,archived=? WHERE id=? AND version=? "
                                "AND state=? AND epoch=? AND reviewed=?",
                                (target, now.timestamp() if target == State.ARCHIVED else row["archived"],
@@ -81,7 +87,9 @@ class Lifecycle:
                 result["stdout_excerpt"], result["artifacts"] = "", []
                 db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), row["id"]))
             db.execute("DELETE FROM events WHERE timestamp<?", (aggregate_cutoff,))
-            db.execute("DELETE FROM costs WHERE timestamp<?", (aggregate_cutoff,))
+            db.execute("""DELETE FROM costs WHERE timestamp<? AND NOT EXISTS (
+                SELECT 1 FROM reservations r WHERE r.state!='settled'
+                AND costs.id GLOB r.id || ':*')""", (aggregate_cutoff,))
 
     def collect_garbage(self) -> int:
         # Writers link objects under the same SQLite write lock, including across clients.

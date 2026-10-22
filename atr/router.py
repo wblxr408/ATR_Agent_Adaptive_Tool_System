@@ -4,6 +4,7 @@ from typing import Protocol
 
 from atr.accounting import Ledger
 from atr.control.registry import Registry
+from atr.errors import ATRError
 from atr.models import Cost, Intent, Route
 
 
@@ -37,14 +38,21 @@ class Router:
         else:
             # Only a constrained decision enum is accepted; no returned commands are executed.
             reservation = None
-            billed = False
+            billed = recorded = called = False
             try:
                 if self.ledger:
                     reservation = self.ledger.reserve(intent.root_task_id, self.model.max_cost_usd)
+                called = True
                 decision, cost = self.model.decide(intent.summary[:1024], matches[:3])
                 if self.ledger:
-                    self.ledger.record(intent.root_task_id, cost)
-                    billed = cost.amount is not None and not cost.estimated
+                    self.ledger.record(intent.root_task_id, cost,
+                                       entry_id=reservation + ":0" if reservation else None)
+                    recorded = True
+                    billed = cost.currency == "USD" and cost.amount is not None and not cost.estimated
+                    if cost.currency != "USD":
+                        raise ATRError("billing_currency", "budgeted routing must report USD")
+                    if cost.amount is not None and cost.amount > self.model.max_cost_usd:
+                        raise ATRError("adapter_budget", "routing exceeded its declared maximum charge")
                 choice = {"decision": decision} if isinstance(decision, str) else decision
                 result = Route.model_validate({**choice, "reason": "one bounded model decision", "model_calls": 1})
                 if (result.decision == "REUSE" and result.selected not in {m["id"] for m in matches}) or (
@@ -55,11 +63,12 @@ class Router:
                                          task=intent.root_task_id, cost=cost.model_dump())
             except Exception:
                 result = Route(decision="DEFER", reason="routing model failed or returned invalid enum",
-                               model_calls=1)
+                               model_calls=int(called))
             finally:
                 if reservation and self.ledger:
-                    if not billed:
-                        self.ledger.record(intent.root_task_id, Cost(category="router_llm"))
+                    if called and not recorded:
+                        self.ledger.record(intent.root_task_id, Cost(category="router_llm"),
+                                           entry_id=reservation + ":unknown")
                     self.ledger.release(reservation, billing_complete=billed)
         self.registry.store.emit("route_decided", self.registry.clock(), task=intent.root_task_id,
                                  **result.model_dump(), retrieved=[m["id"] for m in matches])
