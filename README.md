@@ -11,6 +11,8 @@ uv run --extra integration atr-native install-clients
 
 安装保留并备份现有两端配置。重载 MCP/重开会话后可用；Codex 新 hook 在 `/hooks` 审阅信任。[接入、工具输入与扩展](docs/native-clients.md)；[理论成本收益与盈亏平衡](docs/cost-benefit.md)。重复稳定任务理论上可能受益，未测量或承诺节省比例。
 
+0.3.1 增加显式启用的[一周使用量观测](docs/weekly-observation.md)：本地采集真实Token、ATR命中/调用/失败/耗时，与前7天日志比较，到期停止。仅保存数值；缺少账单或任务质量对照时不声称因果节省。
+
 ## 能力与边界
 
 | 能力 | 实现 |

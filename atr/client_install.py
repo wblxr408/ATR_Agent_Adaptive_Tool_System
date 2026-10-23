@@ -55,10 +55,39 @@ def _hook(config: dict[str, Any], command: str) -> dict[str, Any]:
     return config
 
 
+def _usage_hooks(config: dict[str, Any], home: Path, client: str) -> dict[str, Any]:
+    if not (home / "probe.json").exists():
+        return config
+    if not _read(home / "probe.json").get("enabled", False):
+        return config
+    argv = [
+        sys.executable,
+        "-m",
+        "atr.usage_probe",
+        "--home",
+        str(home),
+        "--client",
+        client,
+        "hook",
+    ]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else __import__("shlex").join(argv)
+    for event in ("Stop", "SessionEnd", "SubagentStop"):
+        groups = config.setdefault("hooks", {}).setdefault(event, [])
+        for group in groups:
+            group["hooks"] = [
+                hook
+                for hook in group.get("hooks", [])
+                if "-m atr.usage_probe --home " not in hook.get("command", "")
+            ]
+        groups[:] = [group for group in groups if group.get("hooks")]
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+    return config
+
+
 def install_clients(home: Path, codex: Path, claude: Path, claude_config: Path) -> list[str]:
     home = home.resolve()
-    args = ["-m", "atr.mcp_server", "--home", str(home)]
-    server = {"command": sys.executable, "args": args}
+    args = ["-m", "atr.mcp_server", "--home", str(home), "--client", "codex"]
+    server = {"command": sys.executable, "args": [*args[:-1], "claude"]}
     command = (
         subprocess.list2cmdline([sys.executable, "-m", "atr.hook", "--home", str(home)])
         if os.name == "nt"
@@ -90,8 +119,12 @@ def install_clients(home: Path, codex: Path, claude: Path, claude_config: Path) 
     if preserved != before:
         raise ValueError("cannot edit ATR TOML table while preserving other settings")
     # Parse everything before making changes; malformed input cannot cause a partial config write.
-    codex_hooks = _hook(_read(codex / "hooks.json"), command)
-    claude_hooks = _hook(_read(claude / "settings.json"), command)
+    codex_hooks = _usage_hooks(
+        _hook(_read(codex / "hooks.json"), command + " --client codex"), home, "codex"
+    )
+    claude_hooks = _usage_hooks(
+        _hook(_read(claude / "settings.json"), command + " --client claude"), home, "claude"
+    )
     cc = _read(claude_config)
     cc.setdefault("mcpServers", {})["atr"] = server
     writes = {

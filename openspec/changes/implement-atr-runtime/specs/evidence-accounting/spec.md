@@ -6,6 +6,17 @@
 
 ## ADDED Requirements
 
+### Requirement: Bounded real weekly observation
+系统 SHALL 在用户显式启用后，固定7天采集窗口及此前7天观察基线；客户端累计计数与重复消息 SHALL 去重，日志正文 SHALL NOT 持久化到探针库。期满 SHALL 停止新增探针事件，报告区分缺失、实测数值和未知费用，不把观察总量变化归因为ATR净收益。
+
+#### Scenario: Duplicated or partially appended usage
+- **WHEN** Codex 重复累计用量、Claude 重复同一消息、或日志末行尚未写完
+- **THEN** 不重复计入，末行补全后仍能采集；大行受限跳过但继续收集后续用量，并记录覆盖缺口
+
+#### Scenario: End of the week
+- **WHEN** 固定窗口结束或操作者停用
+- **THEN** 不再新增探针事件；期满报告保留成本/质量对照未知，清理仅属于探针的收尾hook并保留ATR功能
+
 ### Requirement: Trusted aggregate budget and failed response evidence
 费用预留 SHALL 原子执行持久全局和宿主签发的任务预算。供应商已知用量及账单身份 SHALL 在响应异常时保留。JSON Artifact 的键和值 SHALL 脱敏，碰撞键不得静默覆盖。
 

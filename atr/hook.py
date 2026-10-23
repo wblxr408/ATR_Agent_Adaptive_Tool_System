@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -62,13 +63,26 @@ def hint(event: dict[str, Any], home: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument("--client", choices=["codex", "claude", "unknown"], default="unknown")
     args = parser.parse_args()
+    started = time.perf_counter()
     try:
         raw = sys.stdin.buffer.read(262145)
         event = json.loads(raw) if len(raw) <= 262144 else {}
         response = hint(event if isinstance(event, dict) else {}, args.home)
     except (ValueError, OSError):
         response = {}
+    from atr.usage_probe import record
+
+    context = response.get("hookSpecificOutput", {}).get("additionalContext", "")
+    record(
+        args.home,
+        args.client,
+        "hook",
+        matched=bool(context),
+        context_chars=len(context),
+        duration_ms=(time.perf_counter() - started) * 1000,
+    )
     sys.stdout.buffer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
     return 0
 
